@@ -43,13 +43,39 @@ installs the advices described below.
 
 ## Setup
 
-Tell Forge your username (only used to look up the access token):
+Tell Forge your username (used to recognize you in topic lists, and in
+PAT mode to look up the access token):
 
 ```
 git config --global azure.user USERNAME
 ```
 
-Create a [personal access token](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate)
+Then, in a repository cloned from Azure DevOps,
+`M-x forge-add-repository`.
+
+### Entra ID (Azure CLI, default)
+
+Requests authenticate with a Microsoft Entra ID access token acquired
+through the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/):
+install `az` and log in once with `az login`. Tokens are cached for
+about an hour per host and refreshed automatically shortly before they
+expire. The token is issued for the active tenant/subscription, which
+you can switch with `az account set`. When the login itself has
+expired, requests fail with a `user-error` telling you to re-run
+`az login`.
+
+If GUI Emacs cannot find `az`, set `forge-azure-az-executable` to its
+full path.
+
+### Personal access token
+
+Alternatively, set
+
+```elisp
+(setq forge-azure-auth 'pat)
+```
+
+create a [personal access token](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate)
 with at least the **Code (Read & Write)** scope, and store it with
 auth-source:
 
@@ -57,8 +83,7 @@ auth-source:
 machine dev.azure.com login USERNAME^forge password TOKEN
 ```
 
-Then `M-x auth-source-forget-all-cached` and, in a repository cloned
-from Azure DevOps, `M-x forge-add-repository`.
+After changing the entry, `M-x auth-source-forget-all-cached`.
 
 Both remote url formats are supported:
 
@@ -98,8 +123,10 @@ functions whose behavior is hard-coded per forge:
   "Github only" guard
 - `forge-select-merge-method` — offer Azure's merge strategies
 
-ghub itself is not modified: requests authenticate with
-`Authorization: Basic base64(user:PAT)` headers built by this package.
+ghub itself is not modified: requests authenticate with headers built
+by this package — `Authorization: Bearer <token>` with an Entra ID
+access token from the Azure CLI, or `Authorization: Basic
+base64(user:PAT)` depending on `forge-azure-auth`.
 
 **A Forge update may break this package**; it is developed against the
 Forge version in `Package-Requires`.

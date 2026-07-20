@@ -6,7 +6,7 @@
 ;; Maintainer: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/forge-azure
 ;; Keywords: git tools vc
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (forge "0.6.7"))
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -47,7 +47,15 @@
 ;;
 ;;   git config --global azure.user USERNAME
 ;;
-;; and an auth-source entry (PAT with at least "Code Read & Write"):
+;; By default (`forge-azure-auth' is `entra') requests authenticate
+;; with a Microsoft Entra ID access token acquired through the Azure
+;; CLI; log in once with "az login".  In this mode `azure.user' is
+;; optional, but recommended so Forge can recognize you in topic
+;; lists.
+;;
+;; Alternatively, with (setq forge-azure-auth 'pat), authenticate
+;; with a personal access token (at least "Code Read & Write") from
+;; an auth-source entry:
 ;;
 ;;   machine dev.azure.com login USERNAME^forge password TOKEN
 ;;
@@ -63,6 +71,25 @@
 (require 'forge-client)
 (require 'forge-issue)
 (require 'forge-pullreq)
+
+;;; Options
+
+(defgroup forge-azure nil
+  "Azure DevOps support for Forge."
+  :group 'forge)
+
+(defcustom forge-azure-auth 'entra
+  "How to authenticate against Azure DevOps.
+`entra' acquires a Microsoft Entra ID access token through the
+Azure CLI, which requires being logged in with \"az login\".
+`pat' sends a personal access token from auth-source using basic
+authentication."
+  :type '(choice (const :tag "Entra ID via Azure CLI" entra)
+                 (const :tag "Personal access token" pat)))
+
+(defcustom forge-azure-az-executable "az"
+  "Name or path of the Azure CLI executable."
+  :type 'string)
 
 ;;; Class
 
@@ -649,18 +676,94 @@ as a comment.  REPO must be TOPIC's repository."
 
 ;; The wrappers use `:auth 'none' and supply the Authorization header
 ;; themselves, because `ghub--auth' would reject the unknown forge
-;; type.  Azure expects basic authentication with any username and a
-;; personal access token as the password.
+;; type.  Azure accepts either a Microsoft Entra ID access token as a
+;; bearer token, or basic authentication with any username and a
+;; personal access token as the password; `forge-azure-auth' selects
+;; the scheme.
+
+(defconst forge-azure--entra-resource "499b84ac-1321-427f-aa17-267ca6975798"
+  "Application ID of the Azure DevOps resource in Microsoft Entra ID.")
+
+(defconst forge-azure--entra-refresh-margin 300
+  "Seconds before expiry at which a cached token is refreshed.")
+
+(defvar forge-azure--entra-tokens (make-hash-table :test #'equal)
+  "Hash table mapping APIHOST to (TOKEN . EXPIRY).")
+
+(defun forge-azure--entra-token (host)
+  "Return a valid Entra ID access token for HOST."
+  (pcase (gethash host forge-azure--entra-tokens)
+    ((and `(,token . ,expiry)
+          (guard (< (+ (float-time) forge-azure--entra-refresh-margin)
+                    expiry)))
+     token)
+    (_ (car (puthash host (forge-azure--entra-acquire-token)
+                     forge-azure--entra-tokens)))))
+
+(defun forge-azure--entra-acquire-token ()
+  "Acquire an Entra ID access token using the Azure CLI.
+Return a cons (TOKEN . EXPIRY), where EXPIRY is a unix timestamp."
+  (unless (executable-find forge-azure-az-executable)
+    (user-error "Cannot find `%s'; install the Azure CLI or set \
+`forge-azure-auth' to `pat'" forge-azure-az-executable))
+  (let ((default-directory temporary-file-directory)
+        (stderr-file (make-temp-file "forge-azure-az-stderr")))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((status (call-process forge-azure-az-executable nil
+                                      (list (current-buffer) stderr-file) nil
+                                      "account" "get-access-token"
+                                      "--resource" forge-azure--entra-resource
+                                      "--output" "json")))
+            (unless (eq status 0)
+              (user-error "az account get-access-token failed: %s"
+                          (string-trim
+                           (with-temp-buffer
+                             (insert-file-contents stderr-file)
+                             (buffer-string)))))
+            (goto-char (point-min))
+            (let* ((data (condition-case nil
+                             (json-parse-buffer :object-type 'alist)
+                           (error (user-error "\
+Cannot parse output of az account get-access-token"))))
+                   (token (alist-get 'accessToken data)))
+              (unless (stringp token)
+                (user-error "\
+No accessToken in output of az account get-access-token"))
+              (cons token (forge-azure--entra-expiry data)))))
+      (delete-file stderr-file))))
+
+(defun forge-azure--entra-expiry (data)
+  "Return the expiry of the token described by DATA as a unix timestamp.
+If DATA contains no usable expiry, return a time close enough to
+now that the token is re-acquired for the next request."
+  (or (let ((expires-on (alist-get 'expires_on data)))
+        (and (numberp expires-on) expires-on))
+      (let ((expires-on (alist-get 'expiresOn data)))
+        (and (stringp expires-on)
+             ;; A local time "YYYY-MM-DD HH:MM:SS.ffffff".
+             (ignore-errors
+               (float-time
+                (encode-time
+                 (parse-time-string
+                  (replace-regexp-in-string "\\.[0-9]+\\'" ""
+                                            expires-on)))))))
+      (+ (float-time) forge-azure--entra-refresh-margin)))
 
 (defun forge-azure--headers (host)
   "Return an alist with the Authorization header for HOST."
-  (let ((username (ghub--username host 'azure)))
-    `(("Authorization"
-       . ,(concat "Basic "
-                  (base64-encode-string
-                   (concat username ":"
-                           (ghub--token host username 'forge nil 'azure))
-                   t))))))
+  (pcase-exhaustive forge-azure-auth
+    ('entra
+     `(("Authorization"
+        . ,(concat "Bearer " (forge-azure--entra-token host)))))
+    ('pat
+     (let ((username (ghub--username host 'azure)))
+       `(("Authorization"
+          . ,(concat "Basic "
+                     (base64-encode-string
+                      (concat username ":"
+                              (ghub--token host username 'forge nil 'azure))
+                      t))))))))
 
 (defun forge-azure--list-value (data)
   "Return the list wrapped in DATA, or DATA itself.

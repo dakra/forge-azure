@@ -160,5 +160,85 @@
                       ('rebase-merge "rebaseMerge"))
                     '("noFastForward" "squash" "rebase" "rebaseMerge")))))
 
+(ert-deftest forge-azure-entra-expiry ()
+  ;; A numeric `expires_on' takes precedence over `expiresOn'.
+  (should (= (forge-azure--entra-expiry '((expires_on . 1700003600)
+                                          (expiresOn . "1970-01-01 00:00:00")))
+             1700003600))
+  ;; The `expiresOn' string is a local time with a fraction.
+  (let* ((time 1700000000)
+         (str (format-time-string "%Y-%m-%d %H:%M:%S.123456" time)))
+    (should (= (forge-azure--entra-expiry `((expiresOn . ,str))) time)))
+  ;; Garbage or missing expiry falls back to now plus the margin.
+  (dolist (data '(nil
+                  ((expires_on . "not-a-number"))
+                  ((expiresOn . "garbage"))))
+    (let ((now (float-time))
+          (expiry (forge-azure--entra-expiry data)))
+      (should (<= now expiry (+ (float-time)
+                                forge-azure--entra-refresh-margin))))))
+
+(ert-deftest forge-azure-entra-token-cache ()
+  (let ((forge-azure--entra-tokens (make-hash-table :test #'equal))
+        (calls 0))
+    (cl-letf (((symbol-function 'forge-azure--entra-acquire-token)
+               (lambda ()
+                 (cl-incf calls)
+                 (cons (format "TOK%d" calls) (+ (float-time) 3600)))))
+      (should (equal (forge-azure--entra-token "dev.azure.com") "TOK1"))
+      ;; The second request for the same host hits the cache.
+      (should (equal (forge-azure--entra-token "dev.azure.com") "TOK1"))
+      (should (= calls 1))
+      ;; A different host acquires its own token.
+      (should (equal (forge-azure--entra-token "other.example.com") "TOK2"))
+      (should (= calls 2))
+      ;; A token expiring within the refresh margin is re-acquired.
+      (puthash "dev.azure.com" (cons "STALE" (+ (float-time) 100))
+               forge-azure--entra-tokens)
+      (should (equal (forge-azure--entra-token "dev.azure.com") "TOK3"))
+      (should (= calls 3)))))
+
+(ert-deftest forge-azure-headers-dispatch ()
+  (let ((forge-azure-auth 'entra))
+    (cl-letf (((symbol-function 'forge-azure--entra-token)
+               (lambda (_host) "TOK")))
+      (should (equal (forge-azure--headers "dev.azure.com")
+                     '(("Authorization" . "Bearer TOK"))))))
+  (let ((forge-azure-auth 'pat))
+    (cl-letf (((symbol-function 'ghub--username)
+               (lambda (&rest _) "tester"))
+              ((symbol-function 'ghub--token)
+               (lambda (&rest _) "SECRET")))
+      (should (equal (forge-azure--headers "dev.azure.com")
+                     `(("Authorization"
+                        . ,(concat "Basic "
+                                   (base64-encode-string "tester:SECRET"
+                                                         t))))))))
+  (let ((forge-azure-auth 'bogus))
+    (should-error (forge-azure--headers "dev.azure.com"))))
+
+(ert-deftest forge-azure-entra-errors ()
+  ;; Missing az executable.
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) nil)))
+    (should-error (forge-azure--entra-acquire-token) :type 'user-error))
+  ;; Nonzero exit propagates az's stderr, including its login hint.
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/az"))
+            ((symbol-function 'call-process)
+             (lambda (_program _infile dest _display &rest _args)
+               (with-temp-file (cadr dest)
+                 (insert "ERROR: Please run 'az login' to setup account."))
+               1)))
+    (let ((err (should-error (forge-azure--entra-acquire-token)
+                             :type 'user-error)))
+      (should (string-match-p "az login" (cadr err)))))
+  ;; Output that is not JSON.
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/az"))
+            ((symbol-function 'call-process)
+             (lambda (_program _infile dest _display &rest _args)
+               (with-current-buffer (car dest)
+                 (insert "not json"))
+               0)))
+    (should-error (forge-azure--entra-acquire-token) :type 'user-error)))
+
 (provide 'forge-azure-tests)
 ;;; forge-azure-tests.el ends here
