@@ -801,8 +801,11 @@ now that the token is re-acquired for the next request."
   "Return an alist with the Authorization header for HOST."
   (pcase-exhaustive forge-azure-auth
     ('entra
+     ;; The token must be unibyte; `url-http' rejects requests that
+     ;; combine multibyte header values with a non-ASCII body.
      `(("Authorization"
-        . ,(concat "Bearer " (forge-azure--entra-token host)))))
+        . ,(concat "Bearer " (encode-coding-string
+                              (forge-azure--entra-token host) 'utf-8)))))
     ('pat
      (let ((username (ghub--username host 'azure)))
        `(("Authorization"
