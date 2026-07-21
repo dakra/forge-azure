@@ -57,12 +57,23 @@ Then, in a repository cloned from Azure DevOps,
 
 Requests authenticate with a Microsoft Entra ID access token acquired
 through the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/):
-install `az` and log in once with `az login`. Tokens are cached for
-about an hour per host and refreshed automatically shortly before they
-expire. The token is issued for the active tenant/subscription, which
-you can switch with `az account set`. When the login itself has
-expired, requests fail with a `user-error` telling you to re-run
-`az login`.
+install `az`. Tokens are cached for about an hour per host and
+refreshed automatically shortly before they expire. The token is
+issued for the active tenant/subscription, which you can switch with
+`az account set`. When the CLI reports that logging in is required
+(never logged in, or the login expired), forge-azure runs `az login`
+for you after a confirmation prompt; Emacs blocks until the login
+completes in your browser. Set `forge-azure-az-login` to `t` to skip
+the prompt, or to `nil` to never run `az login` and fail with a
+`user-error` instead.
+
+The login must be completable in the browser: `az login` runs as a
+background process that cannot answer terminal prompts, so in
+environments where az falls back to the device-code flow or asks you
+to select a subscription on the terminal (disable that picker with
+`az config set core.login_experience_v2=off`), Emacs appears to hang
+until the process is killed. Set `forge-azure-az-login` to `nil` and
+log in from a terminal in such environments.
 
 If GUI Emacs cannot find `az`, set `forge-azure-az-executable` to its
 full path.
