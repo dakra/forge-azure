@@ -28,18 +28,22 @@
 
 ;; Azure DevOps backend for Forge, using the Azure DevOps REST API
 ;; (api-version 7.1).  Supported: pulling pull-requests with their
-;; comments, creating pull-requests, commenting, editing and deleting
-;; comments, approving (vote 10) and requesting changes (vote -5),
-;; adding and removing reviewers, completing (merging), abandoning
-;; and reactivating, and checking out pull-requests locally.
+;; comments and linked work items, creating pull-requests (with work
+;; items via `forge-azure-set-work-items', bound to C-c C-w in
+;; `forge-post-mode'), commenting, editing and deleting comments,
+;; approving (vote 10) and requesting changes (vote -5), adding and
+;; removing reviewers, linking and unlinking work items, completing
+;; (merging), abandoning and reactivating, and checking out
+;; pull-requests locally.
 ;;
 ;; The `owner' of a repository is the "{organization}/{project}" pair,
 ;; whose parts appear separately in remote urls, surrounded by
 ;; additional path segments, which are not part of the owner.
 ;;
-;; Not supported: work items (Azure's equivalent of issues; they
-;; belong to a project, not to a repository), notifications, forking,
-;; and checking out pull-requests from forks.
+;; Not supported: work items as topics of their own (Azure's
+;; equivalent of issues; they belong to a project, not to a
+;; repository, and are not modeled as Forge issues), notifications,
+;; forking, and checking out pull-requests from forks.
 ;;
 ;; Setup:
 ;;
@@ -64,8 +68,10 @@
 ;; This package necessarily builds on Forge's internal backend
 ;; interface, which is not a stable API, and additionally advises
 ;; `forge--split-forge-url', `forge-approve-pullreq',
-;; `forge-request-changes' and `forge-select-merge-method'.
-;; A Forge update may therefore break it.
+;; `forge-request-changes' and `forge-select-merge-method', binds
+;; C-c C-w in `forge-post-mode-map', and overrides the Content-Type
+;; header pushed by `ghub--headers' for JSON-patch requests.
+;; A Forge or ghub update may therefore break it.
 
 ;;; Code:
 
@@ -102,6 +108,12 @@ noninteractive sessions `ask' behaves like nil."
   :type '(choice (const :tag "Ask first" ask)
                  (const :tag "Without asking" t)
                  (const :tag "Never" nil)))
+
+(defcustom forge-azure-pull-work-items t
+  "Whether to pull the work items linked to each pull-request.
+Pulling them costs one additional request per pull-request, plus
+one batched request per pull for the work-item titles."
+  :type 'boolean)
 
 ;;; Class
 
@@ -182,13 +194,17 @@ Advice for `forge--split-forge-url', whose generic parsing yields
                 (format "%s:%s" id (if stub path their-id)) t)
                (or their-id path)))))
 
+(defun forge-azure--org (repo)
+  "Return the organization part of REPO's owner."
+  (car (split-string (oref repo owner) "/")))
+
 (defvar forge-azure--user-ids (make-hash-table :test #'equal)
   "Hash table mapping \"APIHOST/ORGANIZATION\" to identity GUIDs.")
 
 (defun forge-azure--user-id (repo)
   "Return the authenticated user's GUID for REPO's organization."
   (let* ((apihost (oref repo apihost))
-         (org (car (split-string (oref repo owner) "/")))
+         (org (forge-azure--org repo))
          (key (concat apihost "/" org)))
     (or (gethash key forge-azure--user-ids)
         (puthash key
@@ -197,6 +213,18 @@ Advice for `forge--split-forge-url', whose generic parsing yields
                               nil :host apihost)
                    .authenticatedUser.id)
                  forge-azure--user-ids))))
+
+(defvar forge-azure--repo-guids (make-hash-table :test #'equal)
+  "Hash table mapping \"APIHOST/OWNER/NAME\" to (PROJECT-GUID . REPO-GUID).")
+
+(defun forge-azure--guids (repo)
+  "Return REPO's project and repository GUIDs as (PROJECT-GUID . REPO-GUID)."
+  (let ((key (format "%s/%s/%s"
+                     (oref repo apihost) (oref repo owner) (oref repo name))))
+    (or (gethash key forge-azure--repo-guids)
+        (let-alist (forge-azure--get repo
+                     "/:owner/_apis/git/repositories/:name")
+          (puthash key (cons .project.id .id) forge-azure--repo-guids)))))
 
 ;;; Pull
 ;;;; Repository
@@ -256,7 +284,11 @@ Advice for `forge--split-forge-url', whose generic parsing yields
     (oset repo issues-p       nil)
     (oset repo wiki-p         nil)
     (oset repo stars          nil)
-    (oset repo watchers       nil)))
+    (oset repo watchers       nil)
+    (puthash (format "%s/%s/%s"
+                     (oref repo apihost) (oref repo owner) (oref repo name))
+             (cons .project.id .id)
+             forge-azure--repo-guids)))
 
 ;;;; Topics
 
@@ -271,7 +303,12 @@ Advice for `forge--split-forge-url', whose generic parsing yields
 (cl-defmethod forge--fetch-pullreqs ((repo forge-azure-repository)
                                      callback since)
   (letrec
-      (( cb (let (val cur cnt pos)
+      (( finish (lambda (val)
+                  (forge-azure--fetch-workitem-titles repo val
+                    (lambda ()
+                      (forge--msg repo t t "Pulling REPO pullreqs")
+                      (funcall callback val)))))
+       ( cb (let (val cur cnt pos)
               (lambda (&optional v)
                 (cond
                   ((and (not pos) v)
@@ -282,19 +319,20 @@ Advice for `forge--split-forge-url', whose generic parsing yields
                    (forge--msg nil nil nil "Pulling pullreq %s/%s" pos cnt)
                    (funcall cb))
                   ((not pos)
-                   (forge--msg repo t t "Pulling REPO pullreqs")
-                   (funcall callback val))
+                   (funcall finish val))
                   ((not (assq 'details (car cur)))
                    (forge--fetch-pullreq-details repo cur cb))
                   ((not (assq 'threads (car cur)))
                    (forge--fetch-pullreq-threads repo cur cb))
+                  ((and forge-azure-pull-work-items
+                        (not (assq 'workitems (car cur))))
+                   (forge-azure--fetch-pullreq-workitems repo cur cb))
                   ((setq cur (cdr cur))
                    (cl-incf pos)
                    (forge--msg nil nil nil "Pulling pullreq %s/%s" pos cnt)
                    (funcall cb))
                   (t
-                   (forge--msg repo t t "Pulling REPO pullreqs")
-                   (funcall callback val)))))))
+                   (funcall finish val)))))))
     (forge--msg repo t nil "Pulling REPO pullreqs")
     (let ((resource "/:owner/_apis/git/repositories/:name/pullrequests")
           (until (or since (oref repo pullreqs-until))))
@@ -339,6 +377,63 @@ Advice for `forge--split-forge-url', whose generic parsing yields
     :callback (lambda (value)
                 (setf (alist-get 'threads (car cur)) value)
                 (funcall cb))))
+
+(defun forge-azure--fetch-pullreq-workitems (repo cur cb)
+  "Fetch the work items linked to the first pull-request in CUR.
+Add them under a `workitems' key, even when there are none, then call CB."
+  (forge-azure--get repo
+    (format "/:owner/_apis/git/repositories/:name/pullRequests/%s/workitems"
+            (alist-get 'pullRequestId (car cur)))
+    nil
+    :callback (lambda (value)
+                (setf (alist-get 'workitems (car cur)) value)
+                (funcall cb))))
+
+(defun forge-azure--fetch-workitem-titles (repo data callback)
+  "Add titles to the work items of the pull-requests in DATA, then call CALLBACK.
+Fetch the titles with batched requests to the organization-wide
+work-item endpoint and merge each one into its work-item alist
+under a `title' key.  Work items the endpoint omits, e.g. deleted
+ones, remain without a title."
+  (let (ids)
+    (dolist (pr data)
+      (dolist (item (alist-get 'workitems pr))
+        (let ((id (string-to-number (alist-get 'id item))))
+          (unless (memq id ids)
+            (push id ids)))))
+    (setq ids (nreverse ids))
+    (if (null ids)
+        (funcall callback)
+      (let ((titles (make-hash-table :test #'eql)))
+        (letrec
+            ((fetch
+              (lambda ()
+                (if ids
+                    (let ((chunk (seq-take ids 200)))
+                      (setq ids (nthcdr 200 ids))
+                      (forge-azure--get repo
+                        (format "/%s/_apis/wit/workitems"
+                                (forge-azure--org repo))
+                        `((ids . ,(mapconcat #'number-to-string chunk ","))
+                          (fields . "System.Title")
+                          (errorPolicy . "omit"))
+                        :callback
+                        (lambda (value)
+                          (dolist (item value)
+                            (puthash (alist-get 'id item)
+                                     (alist-get 'System.Title
+                                                (alist-get 'fields item))
+                                     titles))
+                          (funcall fetch))))
+                  (dolist (pr data)
+                    (dolist (item (alist-get 'workitems pr))
+                      (when-let* ((title (gethash (string-to-number
+                                                   (alist-get 'id item))
+                                                  titles)))
+                        (unless (alist-get 'title item)
+                          (nconc item (list (cons 'title title)))))))
+                  (funcall callback)))))
+          (funcall fetch))))))
 
 (cl-defmethod forge--update-pullreqs ((repo forge-azure-repository) data)
   (forge-azure--update-assignees repo data)
@@ -408,6 +503,8 @@ Advice for `forge--split-forge-url', whose generic parsing yields
                :body         (forge--sanitize-string .description))))
         (closql-insert (forge-db) pullreq t)
         (forge--set-connections repo pullreq 'review-requests .reviewers)
+        (when-let* ((cell (assq 'workitems data)))
+          (forge-azure--store-workitems repo pullreq-id (cdr cell)))
         (dolist (thread .threads)
           (let ((thread-id (alist-get 'id thread)))
             (unless (alist-get 'isDeleted thread)
@@ -459,6 +556,237 @@ collect the users encountered in pull-requests instead."
                   rows)))))
     (oset repo assignees rows)))
 
+;;; Work items
+
+;; Work items belong to a project, not to a repository, and are not
+;; modeled as Forge issues.  Only their links to pull-requests are
+;; mirrored, in a table owned by this package; `forge-pullreq' cannot
+;; be extended with additional slots.
+
+(defun forge-azure--ensure-workitem-table ()
+  "Create the `azure-workitem' table in Forge's database if necessary.
+The table must not have a foreign key on the pullreq table:
+closql updates topics with \"insert or replace\", whose implicit
+delete would cascade here on every update."
+  (emacsql (forge-db)
+           [:create-table-if-not-exists azure-workitem
+            ([(pullreq :not-null)
+              (number :not-null)
+              title url]
+             (:primary-key [pullreq number]))]))
+
+(defun forge-azure--store-workitems (repo pullreq-id items)
+  "Store ITEMS as the work items of REPO's pull-request PULLREQ-ID.
+Replace all previously stored rows.  ITEMS are work-item alists
+as returned by the API, whose ids are strings, optionally with a
+`title' added by `forge-azure--fetch-workitem-titles'."
+  (forge-azure--ensure-workitem-table)
+  (emacsql (forge-db)
+           [:delete-from azure-workitem :where (= pullreq $s1)]
+           pullreq-id)
+  (dolist (item items)
+    (let-alist item
+      (let ((number (if (stringp .id) (string-to-number .id) .id)))
+        (emacsql (forge-db)
+                 [:insert-into azure-workitem :values $v1]
+                 (vector pullreq-id number .title
+                         (forge--format repo 'issue-url-format
+                                        `((?i . ,number)))))))))
+
+(defun forge-azure--workitems (pullreq)
+  "Return the work items stored for PULLREQ as (NUMBER TITLE URL) lists."
+  (forge-azure--ensure-workitem-table)
+  (emacsql (forge-db)
+           [:select [number title url] :from azure-workitem
+            :where (= pullreq $s1)
+            :order-by [(asc number)]]
+           (oref pullreq id)))
+
+(defun forge-azure--pull-pullreq-workitems (repo pullreq &optional callback)
+  "Fetch and store the work items linked to PULLREQ in REPO.
+This costs two small requests instead of a full pull.  Call
+CALLBACK once the work items are stored."
+  (forge-azure--get repo
+    (format "/:owner/_apis/git/repositories/:name/pullRequests/%s/workitems"
+            (oref pullreq number))
+    nil
+    :callback
+    (lambda (value)
+      (let ((data (list (list (cons 'workitems value)))))
+        (forge-azure--fetch-workitem-titles repo data
+          (lambda ()
+            (closql-with-transaction (forge-db)
+              (forge-azure--store-workitems repo (oref pullreq id)
+                                            (alist-get 'workitems (car data))))
+            (when callback
+              (funcall callback))))))))
+
+;;;; Topic header
+
+(defvar-keymap forge-azure-workitem-map
+  "<remap> <magit-visit-thing>"  #'forge-azure-browse-workitem
+  "<remap> <magit-browse-thing>" #'forge-azure-browse-workitem
+  "<mouse-2>"                    #'forge-azure-browse-workitem
+  "<follow-link>"                'mouse-face)
+
+(cl-defun forge-azure-insert-topic-work-items
+    (&optional (topic forge-buffer-topic))
+  "Insert a \"Work items:\" header for TOPIC.
+Do nothing unless TOPIC is a pull-request on Azure DevOps; the
+hook this is on is not specific to a forge.  The work items are
+put on the text as properties, not as sub-sections; header
+functions must insert exactly one section, because
+`magit-insert-headers' re-parents all further sections under the
+first one."
+  (when (and (forge-pullreq-p topic)
+             (cl-typep (forge-get-repository topic) 'forge-azure-repository))
+    (magit-insert-section (topic-work-items)
+      (insert "Work items: ")
+      (if-let* ((items (forge-azure--workitems topic)))
+          (while items
+            (pcase-let ((`(,number ,title ,_url) (car items))
+                        (beg (point)))
+              (insert (magit--propertize-face (format "#%s" number)
+                                              'forge-topic-label))
+              (when title
+                (insert " " (magit--propertize-face
+                             (truncate-string-to-width title 40 nil nil t)
+                             'magit-dimmed)))
+              (add-text-properties
+               beg (point)
+               `( forge-azure-workitem ,(car items)
+                  keymap ,forge-azure-workitem-map
+                  mouse-face highlight
+                  help-echo ,(concat
+                              (and title (concat title "\n"))
+                              "mouse-2, RET: browse work item"))))
+            (when (setq items (cdr items))
+              (insert ", ")))
+        (insert (magit--propertize-face "none" 'magit-dimmed)))
+      (insert ?\n))))
+
+(add-hook 'forge-pullreq-headers-hook #'forge-azure-insert-topic-work-items 90)
+
+(defun forge-azure-browse-workitem (&optional event)
+  "Browse the Azure DevOps work item at point, or the one EVENT clicked."
+  (interactive (list last-nonmenu-event))
+  (when (mouse-event-p event)
+    (mouse-set-point event))
+  (if-let* ((item (get-text-property (point) 'forge-azure-workitem)))
+      (browse-url (caddr item))
+    (user-error "No work item at point")))
+
+;;;; Creation
+
+(defvar-local forge-azure--buffer-workitem-ids nil
+  "Ids of the work items to link to the new pull-request.")
+
+(defun forge-azure-set-work-items (ids)
+  "Set the work items to link to the pull-request being created.
+IDS are work-item ids; they are sent as `workItemRefs' when the
+pull-request is submitted."
+  (interactive
+   (progn
+     (unless (and (derived-mode-p 'forge-post-mode)
+                  (eq forge-edit-post-action 'new-pullreq)
+                  (cl-typep (forge-get-repository forge--buffer-post-object)
+                            'forge-azure-repository))
+       (user-error "Not creating an Azure DevOps pull-request"))
+     (list (delete 0 (mapcar #'string-to-number
+                             (completing-read-multiple
+                              "Work item ids: " nil nil nil
+                              (mapconcat #'number-to-string
+                                         forge-azure--buffer-workitem-ids
+                                         ",")))))))
+  (setq forge-azure--buffer-workitem-ids ids)
+  (message "Work items: %s"
+           (if ids (mapconcat #'number-to-string ids ", ") "none")))
+
+(keymap-set forge-post-mode-map "C-c C-w" #'forge-azure-set-work-items)
+
+;;;; Linking
+
+(defun forge-azure--pullreq-vstfs-url (repo pullreq)
+  "Return the vstfs artifact url identifying PULLREQ in REPO."
+  (pcase-let ((`(,project-guid . ,repo-guid) (forge-azure--guids repo)))
+    (format "vstfs:///Git/PullRequestId/%s%%2F%s%%2F%s"
+            project-guid repo-guid (oref pullreq number))))
+
+(defun forge-azure--workitem-relation-index (relations url)
+  "Return the index of the \"ArtifactLink\" relation for URL in RELATIONS.
+Compare case-insensitively after percent-decoding; the API is
+inconsistent about GUID case and escaping.  Return nil if there
+is no matching relation."
+  (let ((url (downcase (url-unhex-string url))))
+    (cl-position-if (lambda (relation)
+                      (let-alist relation
+                        (and (equal .rel "ArtifactLink")
+                             .url
+                             (equal (downcase (url-unhex-string .url)) url))))
+                    relations)))
+
+(defun forge-azure--current-azure-pullreq ()
+  "Return the pull-request at point, erroring unless it is on Azure DevOps."
+  (let ((pullreq (forge-current-pullreq t)))
+    (unless (cl-typep (forge-get-repository pullreq) 'forge-azure-repository)
+      (user-error "Not an Azure DevOps pull-request"))
+    pullreq))
+
+(defun forge-azure-link-work-item (id)
+  "Link the work item ID to the pull-request at point."
+  (interactive
+   (progn (forge-azure--current-azure-pullreq)
+          (list (read-number "Link work item: "))))
+  (let* ((pullreq (forge-azure--current-azure-pullreq))
+         (repo (forge-get-repository pullreq)))
+    (forge-azure--json-patch repo
+      (format "/%s/_apis/wit/workitems/%s" (forge-azure--org repo) id)
+      (vector
+       `((op . "add")
+         (path . "/relations/-")
+         (value . ((rel . "ArtifactLink")
+                   (url . ,(forge-azure--pullreq-vstfs-url repo pullreq))
+                   (attributes . ((name . "Pull Request")))))))
+      :callback (lambda (&rest _)
+                  (forge-azure--pull-pullreq-workitems
+                   repo pullreq #'forge-refresh-buffer)))))
+
+(defun forge-azure-unlink-work-item (id)
+  "Unlink the work item ID from the pull-request at point."
+  (interactive
+   (let* ((pullreq (forge-azure--current-azure-pullreq))
+          (items (or (forge-azure--workitems pullreq)
+                     (user-error "No linked work items")))
+          (choice (completing-read
+                   "Unlink work item: "
+                   (mapcar (pcase-lambda (`(,number ,title ,_url))
+                             (if title
+                                 (format "%s %s" number title)
+                               (number-to-string number)))
+                           items)
+                   nil t)))
+     (list (string-to-number choice))))
+  (let* ((pullreq (forge-azure--current-azure-pullreq))
+         (repo (forge-get-repository pullreq))
+         (resource (format "/%s/_apis/wit/workitems/%s"
+                           (forge-azure--org repo) id)))
+    (let-alist (forge-azure--get repo resource '(($expand . "relations")))
+      (let ((index (forge-azure--workitem-relation-index
+                    .relations
+                    (forge-azure--pullreq-vstfs-url repo pullreq))))
+        (unless index
+          (user-error "Work item %s is not linked to this pull-request" id))
+        (forge-azure--json-patch repo resource
+          (vector
+           `((op . "test")
+             (path . "/rev")
+             (value . ,.rev))
+           `((op . "remove")
+             (path . ,(format "/relations/%s" index))))
+          :callback (lambda (&rest _)
+                      (forge-azure--pull-pullreq-workitems
+                       repo pullreq #'forge-refresh-buffer)))))))
+
 ;;; Mutations
 
 (cl-defmethod forge--submit-create-pullreq ((_ forge-azure-repository)
@@ -474,7 +802,13 @@ collect the users encountered in pull-requests instead."
         (targetRefName . ,(concat "refs/heads/" base-branch))
         (title . ,title)
         (description . ,body)
-        ,@(and forge--buffer-draft-p '((isDraft . t))))
+        ,@(and forge--buffer-draft-p '((isDraft . t)))
+        ,@(and forge-azure--buffer-workitem-ids
+               `((workItemRefs
+                  . ,(vconcat
+                      (mapcar (lambda (id)
+                                `((id . ,(number-to-string id))))
+                              forge-azure--buffer-workitem-ids))))))
       :callback  (forge--post-submit-callback)
       :errorback (forge--post-submit-errorback))))
 
@@ -904,6 +1238,22 @@ and a `value' key."
 (cl-defun forge-azure--patch (obj resource &optional params &rest keys)
   (declare (indent defun))
   (apply #'forge-azure--request "PATCH" obj resource params keys))
+
+(defun forge-azure--json-patch (obj resource patch &rest keys)
+  "Send PATCH, a JSON-patch document, to RESOURCE for OBJ.
+`ghub--headers' unconditionally pushes a Content-Type of
+\"application/json\"; with `:auth' `none' it returns a plain list
+whose car is exactly that header, and it is called synchronously
+inside `ghub-request', so replacing the value there is safe."
+  (declare (indent defun))
+  (let ((orig (symbol-function 'ghub--headers)))
+    (cl-letf (((symbol-function 'ghub--headers)
+               (lambda (&rest args)
+                 (let ((headers (apply orig args)))
+                   (setcdr (car headers) "application/json-patch+json")
+                   headers))))
+      (apply #'forge-azure--request "PATCH" obj resource nil
+             :payload patch keys))))
 
 (cl-defun forge-azure--delete (obj resource &optional params &rest keys)
   (declare (indent defun))

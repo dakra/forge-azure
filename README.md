@@ -19,13 +19,22 @@ Pull requests only:
 - Completing (merging) with all four merge strategies (merge, squash,
   rebase, rebase+merge), abandoning and reactivating
 - Editing title/description, toggling draft status
+- Work items linked to a pull request: pulled and shown as a
+  clickable "Work items:" header in the pull request buffer,
+  linking/unlinking on existing pull requests
+  (`forge-azure-link-work-item`, `forge-azure-unlink-work-item`),
+  and attaching work items when creating a pull request
+  (`forge-azure-set-work-items`, bound to `C-c C-w` in the post
+  buffer)
 - `forge-browse-*` commands
 
 Not supported:
 
-- **Work items** (Azure's equivalent of issues). They belong to a
-  project, not a repository, so every repository in a project would
-  list the same "issues".
+- **Work items as topics of their own** (Azure's equivalent of
+  issues). They belong to a project, not a repository, so every
+  repository in a project would list the same "issues"; they are not
+  modeled as Forge issues. Only their links to pull requests are
+  mirrored (see above).
 - Notifications, forking, and checking out pull requests from forks.
 
 ## Installation
@@ -114,9 +123,11 @@ the equivalent `dev.azure.com` url instead. Forge treats the
   used as a fallback for closed pull requests; for open ones the
   source branch is checked out directly.
 - The API cannot filter pull requests by update time, so `forge-pull`
-  re-fetches all active pull requests every time (two requests per
-  pull request). Edits to comments on closed pull requests are only
-  picked up by `forge-pull-topic`.
+  re-fetches all active pull requests every time (three requests per
+  pull request, plus one batched title request per pull for the
+  linked work items; set `forge-azure-pull-work-items` to `nil` to
+  skip work items and get back to two). Edits to comments on closed
+  pull requests are only picked up by `forge-pull-topic`.
 - Reviewer lists may include Azure DevOps groups; they appear like
   users.
 
@@ -139,8 +150,19 @@ by this package — `Authorization: Bearer <token>` with an Entra ID
 access token from the Azure CLI, or `Authorization: Basic
 base64(user:PAT)` depending on `forge-azure-auth`.
 
-**A Forge update may break this package**; it is developed against the
-Forge version in `Package-Requires`.
+Work-item links are stored in an `azure-workitem` table owned by this
+package inside Forge's database, created lazily on first use.
+Forge's `forge-pullreq` schema cannot be extended, and the table
+deliberately has no foreign key on the pullreq table, because closql
+rewrites topic rows with `insert or replace`, whose implicit delete
+would cascade. Work-item requests go to the organization-scoped
+`_apis/wit` endpoints. Linking and unlinking use JSON-patch requests,
+for which the `Content-Type` header pushed unconditionally by
+`ghub--headers` is temporarily overridden with
+`application/json-patch+json`.
+
+**A Forge or ghub update may break this package**; it is developed
+against the Forge version in `Package-Requires`.
 
 ## Development
 

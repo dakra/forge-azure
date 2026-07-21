@@ -99,8 +99,12 @@
                                (content . "Thanks")
                                (author . ((uniqueName . "author@example.com")))
                                (publishedDate . "2026-07-09T12:00:00Z")
-                               (lastUpdatedDate . "2026-07-09T12:00:00Z"))))))))
-  "A pull-request as returned by the API, with threads stitched in.")
+                               (lastUpdatedDate . "2026-07-09T12:00:00Z")))))))
+    (workitems . (((id . "5201654")
+                   (url . "https://dev.azure.com/org/_apis/wit/workItems/5201654")
+                   (title . "Implement the thing")))))
+  "A pull-request as returned by the API, with threads and work items
+stitched in.")
 
 (ert-deftest forge-azure-update-pullreq ()
   (forge-azure-tests--with-db
@@ -148,6 +152,188 @@
          (should (eq (oref pullreq state) 'merged))
          (should (equal (oref pullreq merged) "2026-07-10T00:00:00Z")))
        (should (equal (oref repo pullreqs-until) "2026-07-10T00:00:00Z"))))))
+
+(ert-deftest forge-azure-workitem-storage ()
+  (forge-azure-tests--with-db
+   (pcase-let*
+       ((`(,id . ,their-id)
+         (forge--repository-ids 'forge-azure-repository
+                                "dev.azure.com" "org/proj" "repo" t))
+        (repo (forge-azure-repository
+               :id id :forge-id their-id :forge "dev.azure.com"
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"
+               :remote "origin")))
+     (closql-insert (forge-db) repo t)
+     (forge--update-pullreqs repo (list forge-azure-tests--pullreq))
+     (let ((pullreq (forge-get-pullreq repo 303411)))
+       (should (equal (forge-azure--workitems pullreq)
+                      '((5201654 "Implement the thing"
+                         "https://dev.azure.com/org/proj/_workitems/edit/5201654"))))
+       ;; A subsequent update replaces the stored work items.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'workitems data)
+               '(((id . "42") (title . "Other"))
+                 ((id . "7"))))
+         (forge--update-pullreqs repo (list data))
+         (should (equal (forge-azure--workitems pullreq)
+                        '((7 nil
+                           "https://dev.azure.com/org/proj/_workitems/edit/7")
+                          (42 "Other"
+                           "https://dev.azure.com/org/proj/_workitems/edit/42")))))
+       ;; Data without a `workitems' key leaves them untouched.
+       (let ((data (assq-delete-all 'workitems
+                                    (copy-alist forge-azure-tests--pullreq))))
+         (forge--update-pullreqs repo (list data))
+         (should (= (length (forge-azure--workitems pullreq)) 2)))
+       ;; A present key with no items clears them.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'workitems data) nil)
+         (forge--update-pullreqs repo (list data))
+         (should-not (forge-azure--workitems pullreq)))))))
+
+(ert-deftest forge-azure-workitem-title-merge ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (data (list (list (cons 'pullRequestId 1)
+                          (cons 'workitems
+                                (list (list (cons 'id "10") (cons 'url "u10"))
+                                      (list (cons 'id "11") (cons 'url "u11")))))
+                    (list (cons 'pullRequestId 2)
+                          (cons 'workitems
+                                (list (list (cons 'id "10") (cons 'url "u10")))))))
+        (requests nil)
+        (done nil))
+    (cl-letf (((symbol-function 'forge-azure--get)
+               (lambda (_obj resource &optional params &rest keys)
+                 (push (cons resource params) requests)
+                 ;; Only id 10 is returned; 11 could e.g. be deleted.
+                 (funcall (plist-get keys :callback)
+                          '(((id . 10)
+                             (fields . ((System.Title . "Ten")))))))))
+      (forge-azure--fetch-workitem-titles repo data (lambda () (setq done t))))
+    (should done)
+    ;; One request, with deduplicated ids and the omit error policy.
+    (should (= (length requests) 1))
+    (pcase-let ((`(,resource . ,params) (car requests)))
+      (should (equal resource "/org/_apis/wit/workitems"))
+      (should (equal (alist-get 'ids params) "10,11"))
+      (should (equal (alist-get 'errorPolicy params) "omit")))
+    ;; The title is merged into every occurrence; 11 stays title-less.
+    (pcase-let ((`(,pr1 ,pr2) data))
+      (pcase-let ((`(,i10 ,i11) (alist-get 'workitems pr1)))
+        (should (equal (alist-get 'title i10) "Ten"))
+        (should-not (alist-get 'title i11)))
+      (should (equal (alist-get 'title (car (alist-get 'workitems pr2)))
+                     "Ten"))))
+  ;; Without any work items the callback runs without a request.
+  (let ((done nil))
+    (cl-letf (((symbol-function 'forge-azure--get)
+               (lambda (&rest _) (error "Unexpected request"))))
+      (forge-azure--fetch-workitem-titles nil '(((pullRequestId . 1)))
+                                          (lambda () (setq done t))))
+    (should done)))
+
+(ert-deftest forge-azure-workitem-relation-index ()
+  (let ((relations
+         '(((rel . "System.LinkTypes.Hierarchy-Reverse")
+            (url . "https://dev.azure.com/org/_apis/wit/workItems/1"))
+           ((rel . "ArtifactLink")
+            (url . "vstfs:///Git/PullRequestId/AAAA%2Fbbbb%2F42")
+            (attributes . ((name . "Pull Request"))))
+           ((rel . "ArtifactLink")
+            (url . "vstfs:///Git/PullRequestId/cccc%2Fdddd%2F99")))))
+    ;; GUID case and percent-encoding differences do not matter.
+    (should (= (forge-azure--workitem-relation-index
+                relations "vstfs:///Git/PullRequestId/aaaa%2FBBBB%2F42")
+               1))
+    (should (= (forge-azure--workitem-relation-index
+                relations "vstfs:///Git/PullRequestId/aaaa/bbbb/42")
+               1))
+    (should (= (forge-azure--workitem-relation-index
+                relations "vstfs:///Git/PullRequestId/cccc%2Fdddd%2F99")
+               2))
+    (should-not (forge-azure--workitem-relation-index
+                 relations "vstfs:///Git/PullRequestId/cccc%2Fdddd%2F100"))
+    (should-not (forge-azure--workitem-relation-index nil "vstfs:///x"))))
+
+(ert-deftest forge-azure-create-pullreq-workitem-payload ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (payload nil))
+    (cl-letf (((symbol-function 'forge-azure--post)
+               (lambda (_obj _resource &optional params &rest _keys)
+                 (setq payload params)))
+              ((symbol-function 'forge--post-buffer-text)
+               (lambda () (cons "Title" "Body")))
+              ((symbol-function 'magit-split-branch-name)
+               (lambda (branch)
+                 (cons "origin" (string-remove-prefix "origin/" branch)))))
+      (let ((forge--buffer-post-object repo)
+            (forge--buffer-base-branch "origin/main")
+            (forge--buffer-head-branch "origin/feature")
+            (forge--buffer-draft-p nil)
+            (forge-azure--buffer-workitem-ids '(1 23)))
+        (forge--submit-create-pullreq repo repo)
+        (should (equal (alist-get 'workItemRefs payload)
+                       (vector '((id . "1")) '((id . "23")))))
+        (setq forge-azure--buffer-workitem-ids nil)
+        (forge--submit-create-pullreq repo repo)
+        (should-not (assq 'workItemRefs payload))))))
+
+(ert-deftest forge-azure-link-workitem-request ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (pullreq (forge-pullreq :number 42))
+        (captured nil))
+    (cl-letf (((symbol-function 'forge-current-pullreq)
+               (lambda (&optional _demand) pullreq))
+              ((symbol-function 'forge-get-repository)
+               (lambda (&rest _) repo))
+              ((symbol-function 'forge-azure--guids)
+               (lambda (_repo) (cons "proj-guid" "repo-guid")))
+              ((symbol-function 'forge-azure--request)
+               (lambda (method _obj resource &optional _params &rest keys)
+                 (setq captured (list method resource
+                                      (plist-get keys :payload))))))
+      (forge-azure-link-work-item 5201654))
+    (pcase-let ((`(,method ,resource ,payload) captured))
+      (should (equal method "PATCH"))
+      (should (equal resource "/org/_apis/wit/workitems/5201654"))
+      (should (equal payload
+                     (vector
+                      '((op . "add")
+                        (path . "/relations/-")
+                        (value
+                         . ((rel . "ArtifactLink")
+                            (url . "vstfs:///Git/PullRequestId/proj-guid%2Frepo-guid%2F42")
+                            (attributes . ((name . "Pull Request"))))))))))))
+
+(ert-deftest forge-azure-json-patch-content-type ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (headers 'unset))
+    (cl-letf (((symbol-function 'forge-azure--headers)
+               (lambda (_host) nil))
+              ((symbol-function 'ghub-request)
+               (lambda (&rest _)
+                 ;; Evaluate `ghub--headers' as `ghub-request' would,
+                 ;; inside the extent of `forge-azure--json-patch'.
+                 (setq headers
+                       (ghub--headers '() "dev.azure.com" 'none nil 'azure)))))
+      (forge-azure--json-patch repo "/org/_apis/wit/workitems/1"
+        (vector '((op . "test") (path . "/rev") (value . 3)))
+        :host "dev.azure.com"))
+    (should (equal (cl-remove "Content-Type" headers
+                              :test-not #'equal :key #'car)
+                   '(("Content-Type" . "application/json-patch+json"))))
+    ;; Outside that extent `ghub--headers' is unchanged.
+    (should (equal (ghub--headers '() "dev.azure.com" 'none nil 'azure)
+                   '(("Content-Type" . "application/json"))))))
 
 (ert-deftest forge-azure-merge-method-mapping ()
   ;; All symbols offered by the advised `forge-select-merge-method'
