@@ -1179,7 +1179,7 @@ as a comment.  REPO must be TOPIC's repository."
   (forge--topic-template-files-1 repo "md" ".azuredevops"))
 
 (cl-defmethod forge--merge-pullreq
-  ((_repo forge-azure-repository)
+  ((repo  forge-azure-repository)
    (topic forge-topic)
    hash method)
   (forge-azure--patch topic
@@ -1188,7 +1188,9 @@ as a comment.  REPO must be TOPIC's repository."
       (lastMergeSourceCommit . ((commitId . ,(or hash (oref topic head-rev)))))
       (completionOptions
        . ((mergeStrategy . ,(forge-azure--merge-strategy method))
-          (deleteSourceBranch . nil))))))
+          (deleteSourceBranch . nil))))
+    :callback (lambda (&rest _)
+                (forge--pull repo #'forge-refresh-buffer))))
 
 ;;; Checkout
 
