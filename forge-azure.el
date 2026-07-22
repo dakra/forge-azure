@@ -235,7 +235,9 @@ Advice for `forge--split-forge-url', whose generic parsing yields
         (puthash key
                  (let-alist (forge-azure--get nil
                               (format "/%s/_apis/connectionData" org)
-                              nil :host apihost)
+                              ;; This endpoint only exists as a preview version.
+                              '((api-version . "7.1-preview"))
+                              :host apihost)
                    .authenticatedUser.id)
                  forge-azure--user-ids))))
 
