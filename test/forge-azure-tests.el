@@ -283,6 +283,104 @@ stitched in.")
         (forge--submit-create-pullreq repo repo)
         (should-not (assq 'workItemRefs payload))))))
 
+(ert-deftest forge-azure-create-pullreq-auto-complete ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (patch nil)
+        (done nil))
+    (cl-letf (((symbol-function 'forge-azure--post)
+               (lambda (_obj _resource &optional _params &rest keys)
+                 ;; Answer the creation request.
+                 (funcall (plist-get keys :callback)
+                          '((pullRequestId . 42)
+                            (createdBy . ((id . "user-guid"))))
+                          nil nil nil)))
+              ((symbol-function 'forge-azure--patch)
+               (lambda (_obj resource &optional params &rest keys)
+                 (setq patch (list resource params))
+                 (funcall (plist-get keys :callback) nil nil nil nil)))
+              ((symbol-function 'forge--post-submit-callback)
+               (lambda () (lambda (&rest _) (setq done t))))
+              ((symbol-function 'forge--post-submit-errorback)
+               (lambda () #'ignore))
+              ((symbol-function 'forge--post-buffer-text)
+               (lambda () (cons "Title" "Body")))
+              ((symbol-function 'magit-split-branch-name)
+               (lambda (branch)
+                 (cons "origin" (string-remove-prefix "origin/" branch)))))
+      (let ((forge--buffer-post-object repo)
+            (forge--buffer-base-branch "origin/main")
+            (forge--buffer-head-branch "origin/feature")
+            (forge--buffer-draft-p nil)
+            (forge-azure--buffer-workitem-ids nil)
+            (forge-azure--buffer-completion-options
+             '((mergeStrategy . "squash") (deleteSourceBranch . t))))
+        (forge--submit-create-pullreq repo repo)
+        (pcase-let ((`(,resource ,params) patch))
+          (should (equal resource
+                         "/:owner/_apis/git/repositories/:name/pullrequests/42"))
+          (should (equal (alist-get 'autoCompleteSetBy params)
+                         '((id . "user-guid"))))
+          (should (equal (alist-get 'completionOptions params)
+                         '((mergeStrategy . "squash")
+                           (deleteSourceBranch . t)))))
+        (should done)
+        ;; t requests auto-complete without completion options.
+        (setq patch nil done nil)
+        (setq forge-azure--buffer-completion-options t)
+        (forge--submit-create-pullreq repo repo)
+        (should (equal (cadr patch)
+                       '((autoCompleteSetBy . ((id . "user-guid"))))))
+        (should done)
+        ;; A failed auto-complete request does not fail the submission.
+        (setq patch nil done nil)
+        (cl-letf (((symbol-function 'forge-azure--patch)
+                   (lambda (_obj _resource &optional _params &rest keys)
+                     (funcall (plist-get keys :errorback) 'error nil nil nil))))
+          (forge--submit-create-pullreq repo repo))
+        (should done)
+        ;; Without auto-complete no second request is made.
+        (setq patch nil done nil)
+        (setq forge-azure--buffer-completion-options nil)
+        (forge--submit-create-pullreq repo repo)
+        (should-not patch)
+        (should done)))))
+
+(ert-deftest forge-azure-auto-complete-default ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com")))
+    (cl-letf (((symbol-function 'forge-get-repository)
+               (lambda (&rest _) repo)))
+      (with-temp-buffer
+        (setq-local forge-edit-post-action 'new-pullreq)
+        (setq-local forge--buffer-post-object repo)
+        (let ((forge-azure-auto-complete
+               '((mergeStrategy . "squash") (deleteSourceBranch . t))))
+          (forge-azure--init-auto-complete))
+        (should (equal forge-azure--buffer-completion-options
+                       '((mergeStrategy . "squash")
+                         (deleteSourceBranch . t)))))
+      ;; Other post buffers are left alone.
+      (with-temp-buffer
+        (setq-local forge-edit-post-action 'reply)
+        (setq-local forge--buffer-post-object repo)
+        (let ((forge-azure-auto-complete t))
+          (forge-azure--init-auto-complete))
+        (should-not forge-azure--buffer-completion-options)))))
+
+(ert-deftest forge-azure-auto-complete-safe-p ()
+  (should (eq (get 'forge-azure-auto-complete 'safe-local-variable)
+              #'forge-azure--auto-complete-safe-p))
+  (should (forge-azure--auto-complete-safe-p nil))
+  (should (forge-azure--auto-complete-safe-p t))
+  (should (forge-azure--auto-complete-safe-p
+           '((mergeStrategy . "squash") (deleteSourceBranch . t))))
+  (should-not (forge-azure--auto-complete-safe-p "squash"))
+  (should-not (forge-azure--auto-complete-safe-p '(("x" . 1))))
+  (should-not (forge-azure--auto-complete-safe-p '(mergeStrategy))))
+
 (ert-deftest forge-azure-link-workitem-request ()
   (let ((repo (forge-azure-repository
                :owner "org/proj" :name "repo"
@@ -336,14 +434,10 @@ stitched in.")
                    '(("Content-Type" . "application/json"))))))
 
 (ert-deftest forge-azure-merge-method-mapping ()
-  ;; All symbols offered by the advised `forge-select-merge-method'
-  ;; must be handled by `forge--merge-pullreq'.
+  ;; All symbols offered by `forge-azure--read-merge-method' must be
+  ;; handled by `forge-azure--merge-strategy'.
   (dolist (method '(merge squash rebase rebase-merge))
-    (should (member (pcase-exhaustive method
-                      ('merge        "noFastForward")
-                      ('squash       "squash")
-                      ('rebase       "rebase")
-                      ('rebase-merge "rebaseMerge"))
+    (should (member (forge-azure--merge-strategy method)
                     '("noFastForward" "squash" "rebase" "rebaseMerge")))))
 
 (ert-deftest forge-azure-entra-expiry ()

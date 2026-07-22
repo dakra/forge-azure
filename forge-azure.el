@@ -29,12 +29,13 @@
 ;; Azure DevOps backend for Forge, using the Azure DevOps REST API
 ;; (api-version 7.1).  Supported: pulling pull-requests with their
 ;; comments and linked work items, creating pull-requests (with work
-;; items via `forge-azure-set-work-items', bound to C-c C-w in
+;; items via `forge-azure-set-work-items', C-c C-w, and auto-complete
+;; via `forge-azure-toggle-auto-complete', C-c C-a, both in
 ;; `forge-post-mode'), commenting, editing and deleting comments,
 ;; approving (vote 10) and requesting changes (vote -5), adding and
-;; removing reviewers, linking and unlinking work items, completing
-;; (merging), abandoning and reactivating, and checking out
-;; pull-requests locally.
+;; removing reviewers, linking and unlinking work items, setting and
+;; canceling auto-complete, completing (merging), abandoning and
+;; reactivating, and checking out pull-requests locally.
 ;;
 ;; The `owner' of a repository is the "{organization}/{project}" pair,
 ;; whose parts appear separately in remote urls, surrounded by
@@ -69,9 +70,9 @@
 ;; interface, which is not a stable API, and additionally advises
 ;; `forge--split-forge-url', `forge-approve-pullreq',
 ;; `forge-request-changes' and `forge-select-merge-method', binds
-;; C-c C-w in `forge-post-mode-map', and overrides the Content-Type
-;; header pushed by `ghub--headers' for JSON-patch requests.
-;; A Forge or ghub update may therefore break it.
+;; C-c C-w and C-c C-a in `forge-post-mode-map', and overrides the
+;; Content-Type header pushed by `ghub--headers' for JSON-patch
+;; requests.  A Forge or ghub update may therefore break it.
 
 ;;; Code:
 
@@ -114,6 +115,30 @@ noninteractive sessions `ask' behaves like nil."
 Pulling them costs one additional request per pull-request, plus
 one batched request per pull for the work-item titles."
   :type 'boolean)
+
+(defun forge-azure--auto-complete-safe-p (value)
+  "Return non-nil if VALUE is a safe value for `forge-azure-auto-complete'."
+  (or (memq value '(nil t))
+      (and (proper-list-p value)
+           (cl-every (lambda (cell)
+                       (and (consp cell)
+                            (symbolp (car cell))
+                            (atom (cdr cell))))
+                     value))))
+
+(defcustom forge-azure-auto-complete nil
+  "Whether auto-complete is turned on for new pull-requests.
+When nil, auto-complete is off unless turned on with
+`forge-azure-toggle-auto-complete' in the post buffer.
+When t, it is turned on with Azure's default completion options.
+Any other value is an alist sent as the `completionOptions',
+e.g. \((mergeStrategy . \"squash\") (deleteSourceBranch . t)); valid merge
+strategies are \"noFastForward\", \"squash\", \"rebase\" and \"rebaseMerge\"."
+  :type '(choice (const :tag "Off" nil)
+                 (const :tag "On, with default completion options" t)
+                 (alist :tag "On, with these completion options"
+                        :key-type symbol :value-type sexp))
+  :safe #'forge-azure--auto-complete-safe-p)
 
 ;;; Class
 
@@ -704,6 +729,55 @@ pull-request is submitted."
 
 (keymap-set forge-post-mode-map "C-c C-w" #'forge-azure-set-work-items)
 
+(defvar-local forge-azure--buffer-completion-options nil
+  "Completion options for auto-completing the new pull-request.
+Nil when auto-complete is off, t when it is on with Azure's
+default completion options, otherwise an alist sent as the
+`completionOptions' when auto-complete is set after submitting.")
+
+(defun forge-azure--init-auto-complete ()
+  "Initialize auto-complete for a new pull-request.
+Take the initial value from `forge-azure-auto-complete', whose
+directory-local value, if any, is in effect in the post buffer."
+  (when (and forge-azure-auto-complete
+             (eq forge-edit-post-action 'new-pullreq)
+             (cl-typep (forge-get-repository forge--buffer-post-object)
+                       'forge-azure-repository))
+    (setq forge-azure--buffer-completion-options forge-azure-auto-complete)))
+
+(add-hook 'forge-edit-post-hook #'forge-azure--init-auto-complete)
+
+(defun forge-azure-toggle-auto-complete ()
+  "Toggle auto-completing the pull-request being created.
+The initial state comes from `forge-azure-auto-complete'.  When
+turning auto-complete on, prompt for the merge strategy and
+whether to delete the source branch.  Auto-complete cannot be
+requested in the creation request itself; it is set with a second
+request once the pull-request exists, and the pull-request then
+completes as soon as all branch policies are satisfied."
+  (interactive)
+  (unless (and (derived-mode-p 'forge-post-mode)
+               (eq forge-edit-post-action 'new-pullreq)
+               (cl-typep (forge-get-repository forge--buffer-post-object)
+                         'forge-azure-repository))
+    (user-error "Not creating an Azure DevOps pull-request"))
+  (setq forge-azure--buffer-completion-options
+        (and (not forge-azure--buffer-completion-options)
+             (forge-azure--read-completion-options)))
+  (message "Auto-complete: %s"
+           (pcase forge-azure--buffer-completion-options
+             ('nil "off")
+             ('t   "on")
+             (options
+              (let-alist options
+                (string-join
+                 (delq nil (list "on" .mergeStrategy
+                                 (and .deleteSourceBranch
+                                      "delete source branch")))
+                 ", "))))))
+
+(keymap-set forge-post-mode-map "C-c C-a" #'forge-azure-toggle-auto-complete)
+
 ;;;; Linking
 
 (defun forge-azure--pullreq-vstfs-url (repo pullreq)
@@ -787,6 +861,60 @@ is no matching relation."
                       (forge-azure--pull-pullreq-workitems
                        repo pullreq #'forge-refresh-buffer)))))))
 
+;;;; Auto-complete
+
+(defun forge-azure--read-merge-method ()
+  "Read one of the merge methods Azure DevOps offers, as a symbol."
+  (magit-read-char-case "Merge method " t
+    (?m "[m]erge"  'merge)
+    (?s "[s]quash" 'squash)
+    (?r "[r]ebase" 'rebase)
+    (?b "rebase+merge [b]" 'rebase-merge)))
+
+(defun forge-azure--merge-strategy (method)
+  "Return the Azure DevOps merge strategy for the symbol METHOD."
+  (pcase-exhaustive method
+    ('merge        "noFastForward")
+    ('squash       "squash")
+    ('rebase       "rebase")
+    ('rebase-merge "rebaseMerge")))
+
+(defun forge-azure--read-completion-options ()
+  "Read auto-completion options, returning a `completionOptions' alist."
+  `((mergeStrategy . ,(forge-azure--merge-strategy
+                       (forge-azure--read-merge-method)))
+    (deleteSourceBranch . ,(and (y-or-n-p "Delete source branch? ") t))))
+
+(defun forge-azure-set-auto-complete ()
+  "Set auto-complete on the pull-request at point.
+Prompt for the merge strategy and whether to delete the source
+branch.  The pull-request completes as soon as all branch
+policies are satisfied."
+  (interactive)
+  (let* ((pullreq (forge-azure--current-azure-pullreq))
+         (repo (forge-get-repository pullreq)))
+    (forge-azure--patch pullreq
+      "/:owner/_apis/git/repositories/:repo/pullrequests/:number"
+      `((autoCompleteSetBy . ((id . ,(forge-azure--user-id repo))))
+        (completionOptions . ,(forge-azure--read-completion-options)))
+      :callback (lambda (&rest _)
+                  (message "Auto-complete set")
+                  (forge--pull repo #'forge-refresh-buffer)))))
+
+(defun forge-azure-cancel-auto-complete ()
+  "Cancel auto-complete on the pull-request at point."
+  (interactive)
+  (let* ((pullreq (forge-azure--current-azure-pullreq))
+         (repo (forge-get-repository pullreq)))
+    (forge-azure--patch pullreq
+      "/:owner/_apis/git/repositories/:repo/pullrequests/:number"
+      ;; The all-zeros GUID unsets `autoCompleteSetBy'.
+      '((autoCompleteSetBy
+         . ((id . "00000000-0000-0000-0000-000000000000"))))
+      :callback (lambda (&rest _)
+                  (message "Auto-complete canceled")
+                  (forge--pull repo #'forge-refresh-buffer)))))
+
 ;;; Mutations
 
 (cl-defmethod forge--submit-create-pullreq ((_ forge-azure-repository)
@@ -795,7 +923,10 @@ is no matching relation."
                (`(,_base-remote . ,base-branch)
                 (magit-split-branch-name forge--buffer-base-branch))
                (`(,_head-remote . ,head-branch)
-                (magit-split-branch-name forge--buffer-head-branch)))
+                (magit-split-branch-name forge--buffer-head-branch))
+               (options forge-azure--buffer-completion-options)
+               (callback (forge--post-submit-callback))
+               (errorback (forge--post-submit-errorback)))
     (forge-azure--post base-repo
       "/:owner/_apis/git/repositories/:name/pullrequests"
       `((sourceRefName . ,(concat "refs/heads/" head-branch))
@@ -809,8 +940,29 @@ is no matching relation."
                       (mapcar (lambda (id)
                                 `((id . ,(number-to-string id))))
                               forge-azure--buffer-workitem-ids))))))
-      :callback  (forge--post-submit-callback)
-      :errorback (forge--post-submit-errorback))))
+      :callback
+      (if (not options)
+          callback
+        ;; The API ignores auto-complete in the creation request;
+        ;; set it with a second request.
+        (lambda (value headers status req)
+          (let-alist value
+            (forge-azure--patch base-repo
+              (format "/:owner/_apis/git/repositories/:name/pullrequests/%s"
+                      .pullRequestId)
+              `((autoCompleteSetBy . ((id . ,.createdBy.id)))
+                ,@(and (consp options)
+                       `((completionOptions . ,options))))
+              :callback (lambda (&rest _)
+                          (funcall callback value headers status req))
+              ;; The pull-request exists at this point; treating the
+              ;; submission as failed would leave the post buffer
+              ;; around and resubmitting would error.
+              :errorback (lambda (error &rest _)
+                           (funcall callback value headers status req)
+                           (message "Pull-request created, but setting \
+auto-complete failed: %S" error))))))
+      :errorback errorback)))
 
 (cl-defmethod forge--submit-create-post
   ((_     forge-azure-repository)
@@ -962,11 +1114,7 @@ as a comment.  REPO must be TOPIC's repository."
     `((status . "completed")
       (lastMergeSourceCommit . ((commitId . ,(or hash (oref topic head-rev)))))
       (completionOptions
-       . ((mergeStrategy . ,(pcase-exhaustive method
-                              ('merge        "noFastForward")
-                              ('squash       "squash")
-                              ('rebase       "rebase")
-                              ('rebase-merge "rebaseMerge")))
+       . ((mergeStrategy . ,(forge-azure--merge-strategy method))
           (deleteSourceBranch . nil))))))
 
 ;;; Checkout
@@ -1006,11 +1154,7 @@ as a comment.  REPO must be TOPIC's repository."
 (defun forge-azure--select-merge-method (orig)
   "Offer Azure DevOps merge strategies instead of calling ORIG."
   (if (cl-typep (forge-get-repository :tracked) 'forge-azure-repository)
-      (magit-read-char-case "Merge method " t
-        (?m "[m]erge"  'merge)
-        (?s "[s]quash" 'squash)
-        (?r "[r]ebase" 'rebase)
-        (?b "rebase+merge [b]" 'rebase-merge))
+      (forge-azure--read-merge-method)
     (funcall orig)))
 
 (advice-add 'forge-approve-pullreq :around #'forge-azure--approve-pullreq)

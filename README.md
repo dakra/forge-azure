@@ -18,6 +18,18 @@ Pull requests only:
 - Adding and removing reviewers
 - Completing (merging) with all four merge strategies (merge, squash,
   rebase, rebase+merge), abandoning and reactivating
+- Auto-complete (merge automatically once all branch policies are
+  satisfied): turning it on for the pull request being created
+  (`forge-azure-toggle-auto-complete`, bound to `C-c C-a` in the post
+  buffer), and setting or canceling it on existing pull requests
+  (`forge-azure-set-auto-complete`, `forge-azure-cancel-auto-complete`).
+  The option `forge-azure-auto-complete` turns it on by default for
+  new pull requests, e.g. per repository in `.dir-locals.el`:
+
+  ```elisp
+  ((nil . ((forge-azure-auto-complete
+            . ((mergeStrategy . "squash") (deleteSourceBranch . t))))))
+  ```
 - Editing title/description, toggling draft status
 - Work items linked to a pull request: pulled and shown as a
   clickable "Work items:" header in the pull request buffer,
