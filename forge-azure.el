@@ -765,7 +765,11 @@ completes as soon as all branch policies are satisfied."
     (user-error "Not creating an Azure DevOps pull-request"))
   (setq forge-azure--buffer-completion-options
         (and (not forge-azure--buffer-completion-options)
-             (forge-azure--read-completion-options)))
+             (forge-azure--read-completion-options
+              (forge-get-repository forge--buffer-post-object)
+              (concat "refs/heads/"
+                      (cdr (magit-split-branch-name
+                            forge--buffer-base-branch))))))
   (message "Auto-complete: %s"
            (pcase forge-azure--buffer-completion-options
              ('nil "off")
@@ -865,26 +869,91 @@ is no matching relation."
 
 ;;;; Auto-complete
 
-(defun forge-azure--read-merge-method ()
-  "Read one of the merge methods Azure DevOps offers, as a symbol."
-  (magit-read-char-case "Merge method " t
-    (?m "[m]erge"  'merge)
-    (?s "[s]quash" 'squash)
-    (?r "[r]ebase" 'rebase)
-    (?b "rebase+merge [b]" 'rebase-merge)))
+(defconst forge-azure--merge-methods
+  '((merge        ?m "[m]erge"          "noFastForward" allowNoFastForward)
+    (squash       ?s "[s]quash"         "squash"        allowSquash)
+    (rebase       ?r "[r]ebase"         "rebase"        allowRebase)
+    (rebase-merge ?b "rebase+merge [b]" "rebaseMerge"   allowRebaseMerge))
+  "The merge methods Azure DevOps offers.
+Each element has the form (METHOD KEY LABEL STRATEGY POLICY-FLAG),
+where METHOD is the symbol used in this package, KEY and LABEL
+are for prompting, STRATEGY is the `mergeStrategy' the API
+expects, and POLICY-FLAG is the key that allows the method in the
+settings of a \"Require a merge strategy\" branch policy.")
+
+(defconst forge-azure--merge-strategy-policy
+  "fa4e907d-c16b-4a4c-9dfa-4916e5d171ab"
+  "Type GUID of the \"Require a merge strategy\" branch policy.")
+
+(defun forge-azure--allowed-merge-methods (repo refname)
+  "Return the merge methods allowed on REFNAME by REPO's branch policies.
+REFNAME is a fully qualified ref, e.g. \"refs/heads/main\".
+Return all methods when no \"Require a merge strategy\" policy
+applies to REFNAME or when the policies cannot be retrieved."
+  (let ((repo-guid (ignore-errors (cdr (forge-azure--guids repo))))
+        (methods (mapcar #'car forge-azure--merge-methods)))
+    (dolist (policy (forge-azure--get repo
+                      "/:owner/_apis/policy/configurations"
+                      `((policyType . ,forge-azure--merge-strategy-policy))
+                      :noerror t))
+      (let-alist policy
+        (when (and .isEnabled .isBlocking (not .isDeleted)
+                   (seq-some
+                    (lambda (scope)
+                      (let-alist scope
+                        (and (or (not .repositoryId)
+                                 (equal .repositoryId repo-guid))
+                             (pcase (and .matchKind (downcase .matchKind))
+                               ("exact" (equal .refName refname))
+                               ("prefix" (and .refName
+                                              (string-prefix-p .refName
+                                                               refname)))
+                               ;; Such scopes have no `refName'.
+                               ("defaultbranch"
+                                (equal refname
+                                       (concat "refs/heads/"
+                                               (oref repo default-branch))))
+                               ;; No `matchKind' means the scope covers
+                               ;; a whole repository or project.
+                               (_ (not .refName))))))
+                    .settings.scope))
+          (setq methods
+                (seq-filter
+                 (lambda (method)
+                   (alist-get (nth 4 (assq method forge-azure--merge-methods))
+                              .settings))
+                 methods)))))
+    methods))
+
+(defun forge-azure--read-merge-method (&optional repo refname)
+  "Read one of the merge methods Azure DevOps offers, as a symbol.
+With REPO and REFNAME, offer only the methods that REPO's branch
+policies allow on REFNAME."
+  (let ((methods
+         (if repo
+             (let ((allowed (forge-azure--allowed-merge-methods repo refname)))
+               (seq-filter (lambda (elt) (memq (car elt) allowed))
+                           forge-azure--merge-methods))
+           forge-azure--merge-methods)))
+    (unless methods
+      (user-error "Branch policy forbids every merge method"))
+    (let ((key (read-char-choice
+                (concat "Merge method "
+                        (mapconcat (lambda (elt) (nth 2 elt)) methods ", ")
+                        ", or [C-g] to abort ")
+                (mapcar #'cadr methods))))
+      (car (seq-find (lambda (elt) (eq (cadr elt) key)) methods)))))
 
 (defun forge-azure--merge-strategy (method)
   "Return the Azure DevOps merge strategy for the symbol METHOD."
-  (pcase-exhaustive method
-    ('merge        "noFastForward")
-    ('squash       "squash")
-    ('rebase       "rebase")
-    ('rebase-merge "rebaseMerge")))
+  (nth 3 (assq method forge-azure--merge-methods)))
 
-(defun forge-azure--read-completion-options ()
-  "Read auto-completion options, returning a `completionOptions' alist."
+(defun forge-azure--read-completion-options (&optional repo refname)
+  "Read auto-completion options, returning a `completionOptions' alist.
+REPO and REFNAME restrict the offered merge methods as in
+`forge-azure--read-merge-method'."
   `((mergeStrategy . ,(forge-azure--merge-strategy
-                       (forge-azure--read-merge-method)))
+                       (forge-azure--read-merge-method repo refname)))
     (deleteSourceBranch . ,(and (y-or-n-p "Delete source branch? ") t))))
 
 (defun forge-azure-set-auto-complete ()
@@ -898,7 +967,9 @@ policies are satisfied."
     (forge-azure--patch pullreq
       "/:owner/_apis/git/repositories/:repo/pullrequests/:number"
       `((autoCompleteSetBy . ((id . ,(forge-azure--user-id repo))))
-        (completionOptions . ,(forge-azure--read-completion-options)))
+        (completionOptions
+         . ,(forge-azure--read-completion-options
+             repo (concat "refs/heads/" (oref pullreq base-ref)))))
       :callback (lambda (&rest _)
                   (message "Auto-complete set")
                   (forge--pull repo #'forge-refresh-buffer)))))
@@ -1156,7 +1227,14 @@ as a comment.  REPO must be TOPIC's repository."
 (defun forge-azure--select-merge-method (orig)
   "Offer Azure DevOps merge strategies instead of calling ORIG."
   (if (cl-typep (forge-get-repository :tracked) 'forge-azure-repository)
-      (forge-azure--read-merge-method)
+      ;; `forge-merge' reads the pull-request to merge before the
+      ;; method, without exposing it here.  The pull-request at point
+      ;; usually is that pull-request, but it can differ or be nil, in
+      ;; which case all merge methods are offered.
+      (let ((pullreq (forge-current-pullreq)))
+        (forge-azure--read-merge-method
+         (and pullreq (forge-get-repository pullreq))
+         (and pullreq (concat "refs/heads/" (oref pullreq base-ref)))))
     (funcall orig)))
 
 (advice-add 'forge-approve-pullreq :around #'forge-azure--approve-pullreq)
