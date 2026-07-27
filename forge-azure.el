@@ -31,7 +31,8 @@
 ;; comments and linked work items, creating pull-requests (with work
 ;; items via `forge-azure-set-work-items', C-c C-w, and auto-complete
 ;; via `forge-azure-toggle-auto-complete', C-c C-a, both in
-;; `forge-post-mode'), commenting, editing and deleting comments,
+;; `forge-post-mode' and also visible in `forge-post-menu', C-c C-e),
+;; commenting, editing and deleting comments,
 ;; approving (vote 10) and requesting changes (vote -5), adding and
 ;; removing reviewers, linking and unlinking work items, setting and
 ;; canceling auto-complete, completing (merging), abandoning and
@@ -70,9 +71,10 @@
 ;; interface, which is not a stable API, and additionally advises
 ;; `forge--split-forge-url', `forge-approve-pullreq',
 ;; `forge-request-changes' and `forge-select-merge-method', binds
-;; C-c C-w and C-c C-a in `forge-post-mode-map', and overrides the
-;; Content-Type header pushed by `ghub--headers' for JSON-patch
-;; requests.  A Forge or ghub update may therefore break it.
+;; C-c C-w and C-c C-a in `forge-post-mode-map', inserts an "Azure"
+;; column into `forge-post-menu', and overrides the Content-Type
+;; header pushed by `ghub--headers' for JSON-patch requests.  A Forge
+;; or ghub update may therefore break it.
 
 ;;; Code:
 
@@ -532,6 +534,7 @@ ones, remain without a title."
         (forge--set-connections repo pullreq 'review-requests .reviewers)
         (when-let* ((cell (assq 'workitems data)))
           (forge-azure--store-workitems repo pullreq-id (cdr cell)))
+        (forge-azure--store-auto-complete pullreq-id data)
         (dolist (thread .threads)
           (let ((thread-id (alist-get 'id thread)))
             (unless (alist-get 'isDeleted thread)
@@ -703,10 +706,46 @@ first one."
       (browse-url (caddr item))
     (user-error "No work item at point")))
 
+(cl-defun forge-azure-insert-topic-auto-complete
+    (&optional (topic forge-buffer-topic))
+  "Insert an \"Auto-complete:\" header for TOPIC.
+Do nothing unless TOPIC is an open pull-request on Azure DevOps;
+the hook this is on is not specific to a forge."
+  (when (and (forge-pullreq-p topic)
+             (eq (oref topic state) 'open)
+             (cl-typep (forge-get-repository topic) 'forge-azure-repository))
+    (magit-insert-section (topic-auto-complete)
+      (insert "Auto-complete: ")
+      (pcase-let ((`(,setter ,options) (forge-azure--auto-complete topic)))
+        (if (not (or setter options))
+            (insert (magit--propertize-face "off" 'magit-dimmed))
+          (insert (forge-azure--format-completion-options (or options t)))
+          (when setter
+            (insert " " (magit--propertize-face (format "(%s)" setter)
+                                                'magit-dimmed)))))
+      (insert ?\n))))
+
+(add-hook 'forge-pullreq-headers-hook #'forge-azure-insert-topic-auto-complete 91)
+
 ;;;; Creation
 
 (defvar-local forge-azure--buffer-workitem-ids nil
   "Ids of the work items to link to the new pull-request.")
+
+(defun forge-azure--new-pullreq-buffer-p ()
+  "Return non-nil in a post buffer creating an Azure DevOps pull-request."
+  (and (eq forge-edit-post-action 'new-pullreq)
+       (cl-typep (forge-get-repository forge--buffer-post-object)
+                 'forge-azure-repository)))
+
+(defun forge-azure--read-workitem-ids ()
+  "Read work-item ids, offering `forge-azure--buffer-workitem-ids' for editing."
+  (delete 0 (mapcar #'string-to-number
+                    (completing-read-multiple
+                     "Work item ids: " nil nil nil
+                     (mapconcat #'number-to-string
+                                forge-azure--buffer-workitem-ids
+                                ",")))))
 
 (defun forge-azure-set-work-items (ids)
   "Set the work items to link to the pull-request being created.
@@ -714,17 +753,9 @@ IDS are work-item ids; they are sent as `workItemRefs' when the
 pull-request is submitted."
   (interactive
    (progn
-     (unless (and (derived-mode-p 'forge-post-mode)
-                  (eq forge-edit-post-action 'new-pullreq)
-                  (cl-typep (forge-get-repository forge--buffer-post-object)
-                            'forge-azure-repository))
+     (unless (forge-azure--new-pullreq-buffer-p)
        (user-error "Not creating an Azure DevOps pull-request"))
-     (list (delete 0 (mapcar #'string-to-number
-                             (completing-read-multiple
-                              "Work item ids: " nil nil nil
-                              (mapconcat #'number-to-string
-                                         forge-azure--buffer-workitem-ids
-                                         ",")))))))
+     (list (forge-azure--read-workitem-ids))))
   (setq forge-azure--buffer-workitem-ids ids)
   (message "Work items: %s"
            (if ids (mapconcat #'number-to-string ids ", ") "none")))
@@ -749,6 +780,18 @@ directory-local value, if any, is in effect in the post buffer."
 
 (add-hook 'forge-edit-post-hook #'forge-azure--init-auto-complete)
 
+(defun forge-azure--read-toggled-auto-complete ()
+  "Return the toggled value of `forge-azure--buffer-completion-options'.
+Nil when auto-complete is currently on; otherwise prompt for the
+completion options, offering only the merge methods the branch
+policies allow on the base branch of the pull-request being
+created."
+  (and (not forge-azure--buffer-completion-options)
+       (forge-azure--read-completion-options
+        (forge-get-repository forge--buffer-post-object)
+        (concat "refs/heads/"
+                (cdr (magit-split-branch-name forge--buffer-base-branch))))))
+
 (defun forge-azure-toggle-auto-complete ()
   "Toggle auto-completing the pull-request being created.
 The initial state comes from `forge-azure-auto-complete'.  When
@@ -758,31 +801,50 @@ requested in the creation request itself; it is set with a second
 request once the pull-request exists, and the pull-request then
 completes as soon as all branch policies are satisfied."
   (interactive)
-  (unless (and (derived-mode-p 'forge-post-mode)
-               (eq forge-edit-post-action 'new-pullreq)
-               (cl-typep (forge-get-repository forge--buffer-post-object)
-                         'forge-azure-repository))
+  (unless (forge-azure--new-pullreq-buffer-p)
     (user-error "Not creating an Azure DevOps pull-request"))
   (setq forge-azure--buffer-completion-options
-        (and (not forge-azure--buffer-completion-options)
-             (forge-azure--read-completion-options
-              (forge-get-repository forge--buffer-post-object)
-              (concat "refs/heads/"
-                      (cdr (magit-split-branch-name
-                            forge--buffer-base-branch))))))
+        (forge-azure--read-toggled-auto-complete))
   (message "Auto-complete: %s"
-           (pcase forge-azure--buffer-completion-options
-             ('nil "off")
-             ('t   "on")
-             (options
-              (let-alist options
-                (string-join
-                 (delq nil (list "on" .mergeStrategy
-                                 (and .deleteSourceBranch
-                                      "delete source branch")))
-                 ", "))))))
+           (forge-azure--format-completion-options
+            forge-azure--buffer-completion-options)))
 
 (keymap-set forge-post-mode-map "C-c C-a" #'forge-azure-toggle-auto-complete)
+
+(transient-define-infix forge-azure-new-pullreq-set-work-items ()
+  "Set work items for the pull-request being created."
+  :class 'forge--new-topic-set-slot-command
+  :variable 'forge-azure--buffer-workitem-ids
+  :name "work items"
+  :reader (lambda (&rest _) (forge-azure--read-workitem-ids))
+  :formatter (lambda (ids)
+               (mapconcat (lambda (id)
+                            (propertize (format "#%s" id)
+                                        'face 'forge-topic-label))
+                          ids ", "))
+  :if #'forge-azure--new-pullreq-buffer-p)
+
+(transient-define-infix forge-azure-new-pullreq-toggle-auto-complete ()
+  "Toggle auto-completing the pull-request being created.
+When turning auto-complete on, prompt as in
+`forge-azure-toggle-auto-complete'."
+  :class 'forge--new-topic-set-slot-command
+  :variable 'forge-azure--buffer-completion-options
+  :name "auto-complete"
+  :reader (lambda (&rest _) (forge-azure--read-toggled-auto-complete))
+  :formatter #'forge-azure--format-completion-options
+  :if #'forge-azure--new-pullreq-buffer-p)
+
+;; Forge's own "Set" column in `forge-post-menu' is Github-only.
+(unless (ignore-errors
+          (transient-get-suffix 'forge-post-menu
+                                'forge-azure-new-pullreq-set-work-items))
+  (transient-insert-suffix 'forge-post-menu '(0 1)
+    ["Azure"
+     :if forge-azure--new-pullreq-buffer-p
+     ("-w" forge-azure-new-pullreq-set-work-items)
+     ("-a" forge-azure-new-pullreq-toggle-auto-complete)
+     ("-d" forge-new-pullreq-toggle-draft)]))
 
 ;;;; Linking
 
@@ -868,6 +930,61 @@ is no matching relation."
                        repo pullreq #'forge-refresh-buffer)))))))
 
 ;;;; Auto-complete
+
+(defun forge-azure--ensure-pullreq-table ()
+  "Create the `azure-pullreq' table in Forge's database if necessary.
+The table holds pull-request state that `forge-pullreq' has no
+slot for.  It must not have a foreign key on the pullreq table,
+for the reason given in `forge-azure--ensure-workitem-table'."
+  (emacsql (forge-db)
+           [:create-table-if-not-exists azure-pullreq
+            ([(pullreq :not-null :primary-key)
+              auto-complete-setter
+              auto-complete-options])]))
+
+(defun forge-azure--store-auto-complete (pullreq-id data)
+  "Store the auto-complete state in DATA for the pull-request PULLREQ-ID.
+DATA is a pull-request alist as returned by the API.  When it has
+no `autoCompleteSetBy', clear any previously stored state."
+  (forge-azure--ensure-pullreq-table)
+  (let-alist data
+    (if .autoCompleteSetBy
+        (emacsql (forge-db)
+                 [:insert-or-replace-into azure-pullreq :values $v1]
+                 (vector pullreq-id
+                         (or .autoCompleteSetBy.displayName
+                             .autoCompleteSetBy.uniqueName
+                             .autoCompleteSetBy.id)
+                         .completionOptions))
+      (emacsql (forge-db)
+               [:delete-from azure-pullreq :where (= pullreq $s1)]
+               pullreq-id))))
+
+(defun forge-azure--auto-complete (pullreq)
+  "Return the stored auto-complete state of PULLREQ as (SETTER OPTIONS).
+SETTER is the display name of the user who set auto-complete and
+OPTIONS the `completionOptions' alist.  Return nil when
+auto-complete is not set."
+  (forge-azure--ensure-pullreq-table)
+  (car (emacsql (forge-db)
+                [:select [auto-complete-setter auto-complete-options]
+                 :from azure-pullreq
+                 :where (= pullreq $s1)]
+                (oref pullreq id))))
+
+(defun forge-azure--format-completion-options (options)
+  "Format the auto-complete state OPTIONS for display.
+OPTIONS is nil for off, t for on with Azure's default completion
+options, or a `completionOptions' alist."
+  (pcase options
+    ('nil "off")
+    ('t   "on")
+    (options
+     (let-alist options
+       (string-join
+        (delq nil (list "on" .mergeStrategy
+                        (and .deleteSourceBranch "delete source branch")))
+        ", ")))))
 
 (defconst forge-azure--merge-methods
   '((merge        ?m "[m]erge"          "noFastForward" allowNoFastForward)

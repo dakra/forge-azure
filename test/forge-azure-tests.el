@@ -192,6 +192,65 @@ stitched in.")
          (forge--update-pullreqs repo (list data))
          (should-not (forge-azure--workitems pullreq)))))))
 
+(ert-deftest forge-azure-auto-complete-storage ()
+  (forge-azure-tests--with-db
+   (pcase-let*
+       ((`(,id . ,their-id)
+         (forge--repository-ids 'forge-azure-repository
+                                "dev.azure.com" "org/proj" "repo" t))
+        (repo (forge-azure-repository
+               :id id :forge-id their-id :forge "dev.azure.com"
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"
+               :remote "origin")))
+     (closql-insert (forge-db) repo t)
+     ;; Data without `autoCompleteSetBy' means auto-complete is off.
+     (forge--update-pullreqs repo (list forge-azure-tests--pullreq))
+     (let ((pullreq (forge-get-pullreq repo 303411)))
+       (should-not (forge-azure--auto-complete pullreq))
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'autoCompleteSetBy data)
+               '((uniqueName . "author@example.com")
+                 (displayName . "Author")
+                 (id . "39216cd6-0000-0000-0000-000000000001")))
+         (setf (alist-get 'completionOptions data)
+               '((mergeStrategy . "squash")
+                 (deleteSourceBranch . t)))
+         (forge--update-pullreqs repo (list data))
+         (should (equal (forge-azure--auto-complete pullreq)
+                        '("Author" ((mergeStrategy . "squash")
+                                    (deleteSourceBranch . t))))))
+       ;; Without a `displayName' the setter falls back to the
+       ;; `uniqueName'; missing `completionOptions' are stored as nil.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'autoCompleteSetBy data)
+               '((uniqueName . "author@example.com")
+                 (id . "39216cd6-0000-0000-0000-000000000001")))
+         (forge--update-pullreqs repo (list data))
+         (should (equal (forge-azure--auto-complete pullreq)
+                        '("author@example.com" nil))))
+       ;; An update without `autoCompleteSetBy' clears the state.
+       (forge--update-pullreqs repo (list forge-azure-tests--pullreq))
+       (should-not (forge-azure--auto-complete pullreq))))))
+
+(ert-deftest forge-azure-format-completion-options ()
+  (should (equal (forge-azure--format-completion-options nil) "off"))
+  (should (equal (forge-azure--format-completion-options t) "on"))
+  (should (equal (forge-azure--format-completion-options
+                  '((mergeStrategy . "squash")
+                    (deleteSourceBranch . t)))
+                 "on, squash, delete source branch"))
+  (should (equal (forge-azure--format-completion-options
+                  '((mergeStrategy . "noFastForward")
+                    (deleteSourceBranch . nil)))
+                 "on, noFastForward")))
+
+(ert-deftest forge-azure-post-menu-suffixes ()
+  (should (transient-get-suffix 'forge-post-menu
+                                'forge-azure-new-pullreq-set-work-items))
+  (should (transient-get-suffix 'forge-post-menu
+                                'forge-azure-new-pullreq-toggle-auto-complete)))
+
 (ert-deftest forge-azure-workitem-title-merge ()
   (let ((repo (forge-azure-repository
                :owner "org/proj" :name "repo"

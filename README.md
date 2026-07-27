@@ -23,6 +23,9 @@ Pull requests only:
   (`forge-azure-toggle-auto-complete`, bound to `C-c C-a` in the post
   buffer), and setting or canceling it on existing pull requests
   (`forge-azure-set-auto-complete`, `forge-azure-cancel-auto-complete`).
+  Open pull requests show their auto-complete state — merge strategy,
+  whether the source branch is deleted, and who set it — as an
+  "Auto-complete:" header in the pull request buffer.
   The option `forge-azure-auto-complete` turns it on by default for
   new pull requests, e.g. per repository in `.dir-locals.el`:
 
@@ -38,6 +41,10 @@ Pull requests only:
   and attaching work items when creating a pull request
   (`forge-azure-set-work-items`, bound to `C-c C-w` in the post
   buffer)
+- The post menu (`forge-post-menu`, `C-c C-e` in the post buffer) has
+  an "Azure" column showing the work items, auto-complete state and
+  draft flag of the pull request being created, with keys to change
+  them
 - `forge-browse-*` commands
 
 Not supported:
@@ -162,10 +169,11 @@ by this package — `Authorization: Bearer <token>` with an Entra ID
 access token from the Azure CLI, or `Authorization: Basic
 base64(user:PAT)` depending on `forge-azure-auth`.
 
-Work-item links are stored in an `azure-workitem` table owned by this
-package inside Forge's database, created lazily on first use.
-Forge's `forge-pullreq` schema cannot be extended, and the table
-deliberately has no foreign key on the pullreq table, because closql
+Work-item links and auto-complete state are stored in
+`azure-workitem` and `azure-pullreq` tables owned by this package
+inside Forge's database, created lazily on first use. Forge's
+`forge-pullreq` schema cannot be extended, and the tables
+deliberately have no foreign key on the pullreq table, because closql
 rewrites topic rows with `insert or replace`, whose implicit delete
 would cascade. Work-item requests go to the organization-scoped
 `_apis/wit` endpoints. Linking and unlinking use JSON-patch requests,
