@@ -34,8 +34,10 @@
 ;; `forge-post-mode' and also visible in `forge-post-menu', C-c C-e),
 ;; commenting, editing and deleting comments,
 ;; approving (vote 10) and requesting changes (vote -5), adding and
-;; removing reviewers, linking and unlinking work items, setting and
-;; canceling auto-complete, completing (merging), abandoning and
+;; removing reviewers, linking and unlinking work items (also via
+;; -w and -W in `forge-topic-menu'), setting and
+;; canceling auto-complete (also via -o in `forge-topic-menu'),
+;; completing (merging), abandoning and
 ;; reactivating, and checking out pull-requests locally.
 ;;
 ;; The `owner' of a repository is the "{organization}/{project}" pair,
@@ -929,6 +931,19 @@ is no matching relation."
                       (forge-azure--pull-pullreq-workitems
                        repo pullreq #'forge-refresh-buffer)))))))
 
+(defun forge-azure--azure-pullreq-at-point-p ()
+  "Return non-nil if the topic at point is an Azure DevOps pull-request."
+  (and-let* ((pullreq (forge-current-pullreq)))
+    (cl-typep (forge-get-repository pullreq) 'forge-azure-repository)))
+
+(unless (ignore-errors
+          (transient-get-suffix 'forge-topic-menu 'forge-azure-link-work-item))
+  (transient-append-suffix 'forge-topic-menu '(2 2)
+    ["Azure"
+     :if forge-azure--azure-pullreq-at-point-p
+     ("-w" "link work item" forge-azure-link-work-item)
+     ("-W" "unlink work item" forge-azure-unlink-work-item)]))
+
 ;;;; Auto-complete
 
 (defun forge-azure--ensure-pullreq-table ()
@@ -1104,6 +1119,28 @@ policies are satisfied."
       :callback (lambda (&rest _)
                   (message "Auto-complete canceled")
                   (forge--pull repo #'forge-refresh-buffer)))))
+
+(transient-define-suffix forge-azure-topic-toggle-auto-complete ()
+  "Toggle auto-complete on the pull-request at point.
+When turning it on, prompt as in `forge-azure-set-auto-complete'."
+  :description
+  (lambda ()
+    (format (propertize "[%s]" 'face 'transient-delimiter)
+            (propertize "auto-complete" 'face
+                        (if (and-let* ((pullreq (forge-current-pullreq)))
+                              (forge-azure--auto-complete pullreq))
+                            'transient-value
+                          'transient-inactive-value))))
+  (interactive)
+  (if (forge-azure--auto-complete (forge-azure--current-azure-pullreq))
+      (forge-azure-cancel-auto-complete)
+    (forge-azure-set-auto-complete)))
+
+(unless (ignore-errors
+          (transient-get-suffix 'forge-topic-menu
+                                'forge-azure-topic-toggle-auto-complete))
+  (transient-append-suffix 'forge-topic-menu 'forge-azure-unlink-work-item
+    '("-o" forge-azure-topic-toggle-auto-complete)))
 
 ;;; Mutations
 
