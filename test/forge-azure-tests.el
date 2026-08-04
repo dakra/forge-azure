@@ -245,6 +245,199 @@ stitched in.")
                     (deleteSourceBranch . nil)))
                  "on, noFastForward")))
 
+(defconst forge-azure-tests--evaluations
+  '(((evaluationId . "e0000001-0000-0000-0000-000000000001")
+     (status . "rejected")
+     (configuration . ((isBlocking . t)
+                       (isEnabled . t)
+                       (type . ((id . "0609b952-1397-4640-95ec-e00a01b2c241")
+                                (displayName . "Build")))
+                       (settings . ((buildDefinitionId . 8604)
+                                    (displayName . nil)))))
+     (context . ((isExpired . nil)
+                 (buildId . 2937977)
+                 (buildDefinitionName . "ci"))))
+    ((evaluationId . "e0000001-0000-0000-0000-000000000002")
+     (status . "approved")
+     (configuration . ((type . ((id . "0609b952-1397-4640-95ec-e00a01b2c241")))
+                       (settings . ((buildDefinitionId . 8605)
+                                    (displayName . "Deploy check")))))
+     (context . ((isExpired . nil)
+                 (buildId . 2941453)
+                 (buildDefinitionName . "deploy"))))
+    ((evaluationId . "e0000001-0000-0000-0000-000000000003")
+     (status . "queued")
+     (configuration . ((type . ((id . "0609b952-1397-4640-95ec-e00a01b2c241")))
+                       (settings . ((buildDefinitionId . 8700)
+                                    (displayName . nil)))))))
+  "Build-policy evaluations as returned by the API, already filtered.")
+
+(ert-deftest forge-azure-build-evaluations ()
+  (let ((build forge-azure--build-policy))
+    (should (equal
+             (mapcar (lambda (ev) (alist-get 'evaluationId ev))
+                     (forge-azure--build-evaluations
+                      `(((evaluationId . "e1") (status . "approved")
+                         (configuration . ((type . ((id . ,build))))))
+                        ;; Other policy types are dropped.
+                        ((evaluationId . "e2") (status . "approved")
+                         (configuration
+                          . ((type
+                              . ((id . "fa4e907d-c16b-4a4c-9dfa-4916e5d171ab"))))))
+                        ;; Inapplicable build policies are dropped.
+                        ((evaluationId . "e3") (status . "notApplicable")
+                         (configuration . ((type . ((id . ,build)))))))))
+             '("e1")))))
+
+(ert-deftest forge-azure-fetch-pullreq-evaluations ()
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (cur (list (list (cons 'pullRequestId 42)
+                         (cons 'repository
+                               '((project . ((id . "proj-guid"))))))))
+        (captured nil)
+        (done nil))
+    (cl-letf (((symbol-function 'forge-azure--get)
+               (lambda (_obj resource &optional params &rest keys)
+                 (setq captured (cons resource params))
+                 (funcall (plist-get keys :callback)
+                          `(((evaluationId . "e1") (status . "approved")
+                             (configuration
+                              . ((type . ((id . ,forge-azure--build-policy))))))
+                            ((evaluationId . "e2") (status . "approved")
+                             (configuration
+                              . ((type . ((id . "other")))))))))))
+      (forge-azure--fetch-pullreq-evaluations repo cur
+                                              (lambda () (setq done t))))
+    (should done)
+    (pcase-let ((`(,resource . ,params) captured))
+      (should (equal resource "/:owner/_apis/policy/evaluations"))
+      (should (equal (alist-get 'api-version params) "7.1-preview.1"))
+      (should (equal (alist-get 'artifactId params)
+                     "vstfs:///CodeReview/CodeReviewId/proj-guid/42")))
+    (should (equal (mapcar (lambda (ev) (alist-get 'evaluationId ev))
+                           (alist-get 'evaluations (car cur)))
+                   '("e1"))))
+  ;; A response whose evaluations are all filtered out must still add
+  ;; the `evaluations' key; `forge--fetch-pullreqs' only advances past
+  ;; the fetch step once the key is present.
+  (let ((repo (forge-azure-repository
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"))
+        (cur (list (list (cons 'pullRequestId 42)
+                         (cons 'repository
+                               '((project . ((id . "proj-guid")))))))))
+    (cl-letf (((symbol-function 'forge-azure--get)
+               (lambda (_obj _resource &optional _params &rest keys)
+                 (funcall (plist-get keys :callback)
+                          '(((evaluationId . "e1") (status . "approved")
+                             (configuration
+                              . ((type . ((id . "other")))))))))))
+      (forge-azure--fetch-pullreq-evaluations repo cur #'ignore))
+    (let ((cell (assq 'evaluations (car cur))))
+      (should cell)
+      (should-not (cdr cell)))))
+
+(ert-deftest forge-azure-pipeline-storage ()
+  (forge-azure-tests--with-db
+   (pcase-let*
+       ((`(,id . ,their-id)
+         (forge--repository-ids 'forge-azure-repository
+                                "dev.azure.com" "org/proj" "repo" t))
+        (repo (forge-azure-repository
+               :id id :forge-id their-id :forge "dev.azure.com"
+               :owner "org/proj" :name "repo"
+               :apihost "dev.azure.com" :githost "dev.azure.com"
+               :remote "origin")))
+     (closql-insert (forge-db) repo t)
+     (let ((data (copy-alist forge-azure-tests--pullreq)))
+       (setf (alist-get 'evaluations data) forge-azure-tests--evaluations)
+       (forge--update-pullreqs repo (list data)))
+     (let ((pullreq (forge-get-pullreq repo 303411)))
+       ;; The name falls back from the policy's display name to the
+       ;; build definition's name to its id; without a build there is
+       ;; no url.
+       (should (equal (forge-azure--pipelines pullreq)
+                      '(("Deploy check" "approved" nil 2941453
+                         "https://dev.azure.com/org/proj/_build/results?buildId=2941453")
+                        ("build 8700" "queued" nil nil nil)
+                        ("ci" "rejected" nil 2937977
+                         "https://dev.azure.com/org/proj/_build/results?buildId=2937977"))))
+       ;; Open pull-requests show a rollup glyph before their title.
+       (should (equal (forge--format-topic-title pullreq) "✗1/3 Test PR"))
+       ;; A subsequent update replaces the stored pipelines.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'evaluations data)
+               (list (nth 1 forge-azure-tests--evaluations)))
+         (forge--update-pullreqs repo (list data))
+         (should (equal (mapcar #'car (forge-azure--pipelines pullreq))
+                        '("Deploy check")))
+         ;; A single pipeline gets no count.
+         (should (equal (forge--format-topic-title pullreq) "✓ Test PR")))
+       ;; Data without an `evaluations' key leaves them untouched.
+       (forge--update-pullreqs repo (list forge-azure-tests--pullreq))
+       (should (= (length (forge-azure--pipelines pullreq)) 1))
+       ;; Closed pull-requests show no glyph.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'status data) "completed")
+         (setf (alist-get 'closedDate data) "2026-07-10T00:00:00Z")
+         (forge--update-pullreqs repo (list data))
+         (should (equal (forge--format-topic-title
+                         (forge-get-pullreq repo 303411))
+                        "Test PR")))
+       ;; A present key with no evaluations clears them.
+       (let ((data (copy-alist forge-azure-tests--pullreq)))
+         (setf (alist-get 'evaluations data) nil)
+         (forge--update-pullreqs repo (list data))
+         (should-not (forge-azure--pipelines pullreq)))))))
+
+(ert-deftest forge-azure-format-pipeline-rollup ()
+  (should-not (forge-azure--format-pipeline-rollup nil))
+  ;; A single pipeline gets no count.
+  (should (equal (forge-azure--format-pipeline-rollup
+                  '(("ci" "approved" nil 1 "url")))
+                 "✓"))
+  (should (equal (forge-azure--format-pipeline-rollup
+                  '(("ci" "queued" nil nil nil)))
+                 "●"))
+  ;; An expired approval shows as failed, but in the warning face.
+  (let ((rollup (forge-azure--format-pipeline-rollup
+                 '(("ci" "approved" t 1 "url")))))
+    (should (equal rollup "✗"))
+    (should (eq (get-text-property 0 'face rollup) 'warning)))
+  ;; Any failure wins over pending; the count is of approvals.
+  (let ((rollup (forge-azure--format-pipeline-rollup
+                 '(("a" "approved" nil 1 "u")
+                   ("b" "running" nil 2 "u")
+                   ("c" "rejected" nil 3 "u")))))
+    (should (equal rollup "✗1/3"))
+    (should (eq (get-text-property 0 'face rollup) 'error)))
+  (should (equal (forge-azure--format-pipeline-rollup
+                  '(("a" "approved" nil 1 "u")
+                    ("b" "queued" nil nil nil)))
+                 "●1/2"))
+  (should (equal (forge-azure--format-pipeline-rollup
+                  '(("a" "approved" nil 1 "u")
+                    ("b" "approved" nil 2 "u")))
+                 "✓2/2")))
+
+(ert-deftest forge-azure-read-pipeline ()
+  (let ((pipelines '(("ci" "approved" nil 1 "u1")
+                     ("ci" "rejected" nil 2 "u2")
+                     ("ci" "queued" nil nil nil)
+                     ("other" "approved" nil 4 "u4")))
+        (candidates nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (setq candidates (mapcar #'car collection))
+                 "ci <2>")))
+      ;; Duplicate names are disambiguated with the build id, or the
+      ;; position when no build has been queued; unique names are not.
+      (should (equal (forge-azure--read-pipeline pipelines)
+                     '("ci" "rejected" nil 2 "u2")))
+      (should (equal candidates '("ci <1>" "ci <2>" "ci <3>" "other"))))))
+
 (ert-deftest forge-azure-post-menu-suffixes ()
   (should (transient-get-suffix 'forge-post-menu
                                 'forge-azure-new-pullreq-set-work-items))

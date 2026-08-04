@@ -37,8 +37,12 @@
 ;; removing reviewers, linking and unlinking work items (also via
 ;; -w and -W in `forge-topic-menu'), setting and
 ;; canceling auto-complete (also via -o in `forge-topic-menu'),
-;; completing (merging), abandoning and
-;; reactivating, and checking out pull-requests locally.
+;; showing the status of the pipelines (build-validation branch
+;; policies) run for each open pull-request, in a "Pipelines:" header
+;; and as a glyph before the title in topic lists, with
+;; `forge-azure-browse-pipeline' (also via -p in `forge-topic-menu')
+;; opening the build in a browser, completing (merging), abandoning
+;; and reactivating, and checking out pull-requests locally.
 ;;
 ;; The `owner' of a repository is the "{organization}/{project}" pair,
 ;; whose parts appear separately in remote urls, surrounded by
@@ -72,7 +76,8 @@
 ;; This package necessarily builds on Forge's internal backend
 ;; interface, which is not a stable API, and additionally advises
 ;; `forge--split-forge-url', `forge-approve-pullreq',
-;; `forge-request-changes' and `forge-select-merge-method', binds
+;; `forge-request-changes', `forge-select-merge-method' and
+;; `forge--format-topic-title', binds
 ;; C-c C-w and C-c C-a in `forge-post-mode-map', inserts an "Azure"
 ;; column into `forge-post-menu', and overrides the Content-Type
 ;; header pushed by `ghub--headers' for JSON-patch requests.  A Forge
@@ -118,6 +123,13 @@ noninteractive sessions `ask' behaves like nil."
   "Whether to pull the work items linked to each pull-request.
 Pulling them costs one additional request per pull-request, plus
 one batched request per pull for the work-item titles."
+  :type 'boolean)
+
+(defcustom forge-azure-pull-pipeline-status t
+  "Whether to pull the pipeline status of each open pull-request.
+The status comes from the evaluations of the build-validation
+branch policies that apply to the pull-request.  Pulling it costs
+one additional request per open pull-request."
   :type 'boolean)
 
 (defun forge-azure--auto-complete-safe-p (value)
@@ -358,6 +370,10 @@ Advice for `forge--split-forge-url', whose generic parsing yields
                   ((and forge-azure-pull-work-items
                         (not (assq 'workitems (car cur))))
                    (forge-azure--fetch-pullreq-workitems repo cur cb))
+                  ((and forge-azure-pull-pipeline-status
+                        (equal (alist-get 'status (car cur)) "active")
+                        (not (assq 'evaluations (car cur))))
+                   (forge-azure--fetch-pullreq-evaluations repo cur cb))
                   ((setq cur (cdr cur))
                    (cl-incf pos)
                    (forge--msg nil nil nil "Pulling pullreq %s/%s" pos cnt)
@@ -419,6 +435,38 @@ Add them under a `workitems' key, even when there are none, then call CB."
     :callback (lambda (value)
                 (setf (alist-get 'workitems (car cur)) value)
                 (funcall cb))))
+
+(defconst forge-azure--build-policy "0609b952-1397-4640-95ec-e00a01b2c241"
+  "Type GUID of the \"Build\" branch policy.")
+
+(defun forge-azure--build-evaluations (evaluations)
+  "Return the build-policy evaluations in EVALUATIONS that apply.
+Drop evaluations of other policy types, and those whose status is
+\"notApplicable\", e.g. because the pull-request changes no files
+matched by the policy's path filter."
+  (seq-filter (lambda (evaluation)
+                (let-alist evaluation
+                  ;; The API is inconsistent about GUID case.
+                  (and .configuration.type.id
+                       (string-equal-ignore-case .configuration.type.id
+                                                 forge-azure--build-policy)
+                       (not (equal .status "notApplicable")))))
+              evaluations))
+
+(defun forge-azure--fetch-pullreq-evaluations (repo cur cb)
+  "Fetch the policy evaluations for the first pull-request in CUR.
+Add its build-policy evaluations under an `evaluations' key, even
+when there are none, then call CB."
+  (let-alist (car cur)
+    (forge-azure--get repo "/:owner/_apis/policy/evaluations"
+      ;; This endpoint only exists as a preview version.
+      `((api-version . "7.1-preview.1")
+        (artifactId . ,(format "vstfs:///CodeReview/CodeReviewId/%s/%s"
+                               .repository.project.id .pullRequestId)))
+      :callback (lambda (value)
+                  (setf (alist-get 'evaluations (car cur))
+                        (forge-azure--build-evaluations value))
+                  (funcall cb)))))
 
 (defun forge-azure--fetch-workitem-titles (repo data callback)
   "Add titles to the work items of the pull-requests in DATA, then call CALLBACK.
@@ -536,6 +584,8 @@ ones, remain without a title."
         (forge--set-connections repo pullreq 'review-requests .reviewers)
         (when-let* ((cell (assq 'workitems data)))
           (forge-azure--store-workitems repo pullreq-id (cdr cell)))
+        (when-let* ((cell (assq 'evaluations data)))
+          (forge-azure--store-pipelines repo pullreq-id (cdr cell)))
         (forge-azure--store-auto-complete pullreq-id data)
         (dolist (thread .threads)
           (let ((thread-id (alist-get 'id thread)))
@@ -1141,6 +1191,204 @@ When turning it on, prompt as in `forge-azure-set-auto-complete'."
                                 'forge-azure-topic-toggle-auto-complete))
   (transient-append-suffix 'forge-topic-menu 'forge-azure-unlink-work-item
     '("-o" forge-azure-topic-toggle-auto-complete)))
+
+;;; Pipelines
+
+;; The pipelines of a pull-request are the build-validation branch
+;; policies evaluated for it; for repositories on Azure DevOps these
+;; policies are the only mechanism that runs pipelines for
+;; pull-requests.  Their status is stored in a table owned by this
+;; package, for the reason given in `forge-azure--ensure-workitem-table'.
+
+(defun forge-azure--ensure-pipeline-table ()
+  "Create the `azure-pipeline' table in Forge's database if necessary.
+The table holds one row per build-validation policy evaluated for
+a pull-request.  It must not have a foreign key on the pullreq
+table, for the reason given in `forge-azure--ensure-workitem-table'."
+  (emacsql (forge-db)
+           [:create-table-if-not-exists azure-pipeline
+            ([(pullreq :not-null)
+              (evaluation :not-null)
+              name status expired build-id url]
+             (:primary-key [pullreq evaluation]))]))
+
+(defun forge-azure--store-pipelines (repo pullreq-id evaluations)
+  "Store EVALUATIONS as the pipelines of REPO's pull-request PULLREQ-ID.
+Replace all previously stored rows.  EVALUATIONS are build-policy
+evaluation alists as returned by the API."
+  (forge-azure--ensure-pipeline-table)
+  (emacsql (forge-db)
+           [:delete-from azure-pipeline :where (= pullreq $s1)]
+           pullreq-id)
+  (dolist (evaluation evaluations)
+    (let-alist evaluation
+      (emacsql (forge-db)
+               [:insert-into azure-pipeline :values $v1]
+               (vector pullreq-id
+                       .evaluationId
+                       (or .configuration.settings.displayName
+                           .context.buildDefinitionName
+                           (format "build %s"
+                                   .configuration.settings.buildDefinitionId))
+                       .status
+                       (and .context.isExpired t)
+                       .context.buildId
+                       (and .context.buildId
+                            (forge--format repo
+                                           "https://%h/%o/_build/results?buildId=%i"
+                                           `((?i . ,.context.buildId)))))))))
+
+(defun forge-azure--pipelines (pullreq)
+  "Return the pipelines stored for PULLREQ.
+Each element has the form (NAME STATUS EXPIRED BUILD-ID URL),
+where STATUS is the evaluation status as a string, e.g.
+\"approved\", \"rejected\", \"queued\" or \"running\", and URL is
+the address of the build's results page, or nil while no build
+has been queued."
+  (forge-azure--ensure-pipeline-table)
+  (emacsql (forge-db)
+           [:select [name status expired build-id url] :from azure-pipeline
+            :where (= pullreq $s1)
+            :order-by [(asc name)]]
+           (oref pullreq id)))
+
+(defun forge-azure--pipeline-glyph (status expired)
+  "Return a glyph for a pipeline with STATUS and EXPIRED, propertized."
+  (cond (expired
+         (magit--propertize-face "✗" 'warning))
+        ((equal status "approved")
+         (magit--propertize-face "✓" 'success))
+        ((member status '("rejected" "broken"))
+         (magit--propertize-face "✗" 'error))
+        ((equal status "running")
+         (magit--propertize-face "●" 'warning))
+        ((magit--propertize-face "●" 'magit-dimmed))))
+
+(defun forge-azure--format-pipeline-rollup (pipelines)
+  "Format PIPELINES, as returned by `forge-azure--pipelines', as one glyph.
+When there is more than one pipeline, append how many of them are
+approved.  Expired approvals count as not approved; like failures
+they show as \"✗\", but in the less alarming face also used by
+`forge-azure--pipeline-glyph', because a requeue suffices.
+Return nil when PIPELINES is empty."
+  (and pipelines
+       (let ((approved 0) (pending 0) (expired 0) (failed 0))
+         (pcase-dolist (`(,_name ,status ,exp . ,_) pipelines)
+           (cond ((member status '("rejected" "broken"))
+                  (cl-incf failed))
+                 (exp
+                  (cl-incf expired))
+                 ((equal status "approved")
+                  (cl-incf approved))
+                 ((cl-incf pending))))
+         (magit--propertize-face
+          (concat (cond ((or (> failed 0) (> expired 0)) "✗")
+                        ((> pending 0) "●")
+                        ("✓"))
+                  (and (cdr pipelines)
+                       (format "%s/%s" approved (length pipelines))))
+          (cond ((> failed 0) 'error)
+                ((or (> expired 0) (> pending 0)) 'warning)
+                ('success))))))
+
+(defun forge-azure--format-topic-title (orig topic)
+  "Prefix the title of TOPIC with its pipeline status.
+Advice for `forge--format-topic-title'; only affects open
+pull-requests on Azure DevOps with stored pipelines."
+  (let ((title (funcall orig topic)))
+    (if-let* (((forge-pullreq-p topic))
+              ((eq (oref topic state) 'open))
+              ((cl-typep (forge-get-repository topic)
+                         'forge-azure-repository))
+              (rollup (forge-azure--format-pipeline-rollup
+                       (forge-azure--pipelines topic))))
+        (concat rollup " " title)
+      title)))
+
+(advice-add 'forge--format-topic-title :around
+            #'forge-azure--format-topic-title)
+
+(defvar-keymap forge-azure-pipeline-map
+  "<remap> <magit-visit-thing>"  #'forge-azure-browse-pipeline
+  "<remap> <magit-browse-thing>" #'forge-azure-browse-pipeline
+  "<mouse-2>"                    #'forge-azure-browse-pipeline
+  "<follow-link>"                'mouse-face)
+
+(cl-defun forge-azure-insert-topic-pipelines
+    (&optional (topic forge-buffer-topic))
+  "Insert a \"Pipelines:\" header for TOPIC.
+Do nothing unless TOPIC is a pull-request on Azure DevOps with
+stored pipelines; the hook this is on is not specific to a forge.
+The pipelines are put on the text as properties, as in
+`forge-azure-insert-topic-work-items'."
+  (when (and (forge-pullreq-p topic)
+             (cl-typep (forge-get-repository topic) 'forge-azure-repository))
+    (when-let* ((pipelines (forge-azure--pipelines topic)))
+      (magit-insert-section (topic-pipelines)
+        (insert "Pipelines: ")
+        (while pipelines
+          (pcase-let ((`(,name ,status ,expired ,_build-id ,_url)
+                       (car pipelines))
+                      (beg (point)))
+            (insert (forge-azure--pipeline-glyph status expired) " " name)
+            (add-text-properties
+             beg (point)
+             `( forge-azure-pipeline ,(car pipelines)
+                keymap ,forge-azure-pipeline-map
+                mouse-face highlight
+                help-echo ,(format "%s: %s\nmouse-2, RET: browse build"
+                                   name (if expired "expired" status)))))
+          (when (setq pipelines (cdr pipelines))
+            (insert ", ")))
+        (insert ?\n)))))
+
+(add-hook 'forge-pullreq-headers-hook #'forge-azure-insert-topic-pipelines 92)
+
+(defun forge-azure-browse-pipeline (&optional event)
+  "Browse the build of the pipeline at point, or the one EVENT clicked.
+Elsewhere on an Azure DevOps pull-request, choose among its
+pipelines."
+  (interactive (list last-nonmenu-event))
+  (when (mouse-event-p event)
+    (mouse-set-point event))
+  (pcase-let
+      ((`(,name ,_status ,_expired ,_build-id ,url)
+        (or (get-text-property (point) 'forge-azure-pipeline)
+            (let* ((pullreq (forge-azure--current-azure-pullreq))
+                   (pipelines (or (forge-azure--pipelines pullreq)
+                                  (user-error "No pipelines"))))
+              (if (cdr pipelines)
+                  (forge-azure--read-pipeline pipelines)
+                (car pipelines))))))
+    (unless url
+      (user-error "No build has been queued for %s" name))
+    (browse-url url)))
+
+(defun forge-azure--read-pipeline (pipelines)
+  "Read one of PIPELINES, as returned by `forge-azure--pipelines'.
+Several build policies can share a name, e.g. when they require
+the same pipeline under different path filters; disambiguate such
+names with the build id, or failing that the position."
+  (let* ((names (mapcar #'car pipelines))
+         (alist (seq-map-indexed
+                 (lambda (pipeline index)
+                   (pcase-let ((`(,name ,_status ,_expired ,build-id ,_url)
+                                pipeline))
+                     (cons (if (length> (seq-filter
+                                         (lambda (n) (equal n name))
+                                         names)
+                                        1)
+                               (format "%s <%s>" name (or build-id (1+ index)))
+                             name)
+                           pipeline)))
+                 pipelines)))
+    (cdr (assoc (completing-read "Browse pipeline: " alist nil t) alist))))
+
+(unless (ignore-errors
+          (transient-get-suffix 'forge-topic-menu 'forge-azure-browse-pipeline))
+  (transient-append-suffix 'forge-topic-menu
+    'forge-azure-topic-toggle-auto-complete
+    '("-p" "browse pipeline" forge-azure-browse-pipeline)))
 
 ;;; Mutations
 

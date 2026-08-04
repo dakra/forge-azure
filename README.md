@@ -41,6 +41,16 @@ Pull requests only:
   and attaching work items when creating a pull request
   (`forge-azure-set-work-items`, bound to `C-c C-w` in the post
   buffer)
+- Pipeline status: the build-validation branch policies evaluated for
+  each open pull request are pulled with it and shown as a clickable
+  "Pipelines:" header in the pull request buffer and as a rollup
+  glyph before the title in topic lists — `✓` all approved, `✗` any
+  failed or expired, `●` any queued or running, plus an
+  approved/total count when there is more than one pipeline.
+  `forge-azure-browse-pipeline` (also `-p` in `forge-topic-menu`)
+  opens a build's results page in the browser. Set
+  `forge-azure-pull-pipeline-status` to `nil` to skip pulling the
+  status.
 - The post menu (`forge-post-menu`, `C-c C-e` in the post buffer) has
   an "Azure" column showing the work items, auto-complete state and
   draft flag of the pull request being created, with keys to change
@@ -142,10 +152,11 @@ the equivalent `dev.azure.com` url instead. Forge treats the
   used as a fallback for closed pull requests; for open ones the
   source branch is checked out directly.
 - The API cannot filter pull requests by update time, so `forge-pull`
-  re-fetches all active pull requests every time (three requests per
-  pull request, plus one batched title request per pull for the
-  linked work items; set `forge-azure-pull-work-items` to `nil` to
-  skip work items and get back to two). Edits to comments on closed
+  re-fetches all active pull requests every time (four requests per
+  open pull request, plus one batched title request per pull for the
+  linked work items; set `forge-azure-pull-work-items` and
+  `forge-azure-pull-pipeline-status` to `nil` to skip work items and
+  pipeline status and get back to two). Edits to comments on closed
   pull requests are only picked up by `forge-pull-topic`.
 - Reviewer lists may include Azure DevOps groups; they appear like
   users.
@@ -155,7 +166,7 @@ the equivalent `dev.azure.com` url instead. Forge treats the
 Forge has no public interface for adding API backends, so this package
 necessarily implements Forge's internal generic functions
 (`forge--pull`, `forge--submit-*`, …) for a new
-`forge-azure-repository` class, and additionally advises four
+`forge-azure-repository` class, and additionally advises five
 functions whose behavior is hard-coded per forge:
 
 - `forge--split-forge-url` — normalize the three-segment
@@ -163,15 +174,21 @@ functions whose behavior is hard-coded per forge:
 - `forge-approve-pullreq`, `forge-request-changes` — lift the
   "Github only" guard
 - `forge-select-merge-method` — offer Azure's merge strategies
+- `forge--format-topic-title` — prefix titles in topic lists with the
+  pipeline rollup glyph
 
 ghub itself is not modified: requests authenticate with headers built
 by this package — `Authorization: Bearer <token>` with an Entra ID
 access token from the Azure CLI, or `Authorization: Basic
 base64(user:PAT)` depending on `forge-azure-auth`.
 
-Work-item links and auto-complete state are stored in
-`azure-workitem` and `azure-pullreq` tables owned by this package
-inside Forge's database, created lazily on first use. Forge's
+Work-item links, auto-complete state and pipeline status are stored
+in `azure-workitem`, `azure-pullreq` and `azure-pipeline` tables
+owned by this package inside Forge's database, created lazily on
+first use. Pipeline status comes from the policy evaluations
+endpoint (the build-validation branch policies, which are the only
+mechanism that runs pipelines for pull requests on Azure Repos),
+which only exists as a preview api-version. Forge's
 `forge-pullreq` schema cannot be extended, and the tables
 deliberately have no foreign key on the pullreq table, because closql
 rewrites topic rows with `insert or replace`, whose implicit delete
